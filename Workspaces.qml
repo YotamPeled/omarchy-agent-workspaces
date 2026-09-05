@@ -273,6 +273,7 @@ BarWidget {
           width: root.cellWidth; height: parent.height
 
           Text {
+            id: indexText
             anchors.centerIn: parent
             text: slot.modelData === 10 ? "0" : String(slot.modelData)
             font.family: root.bar ? root.bar.fontFamily : Style.font.family
@@ -319,9 +320,15 @@ BarWidget {
         }
 
         Rectangle {   // focus: over the number, and over the name when there is one
+          // The number sits centred in a fixed cell, so the rule already leads it by half the
+          // spare width. Give the far end the same lead, or the rule looks glued to the last
+          // letter of the name while floating clear of the first digit.
+          readonly property real lead: Math.max(0, (cell.width - indexText.implicitWidth) / 2)
           anchors.top: parent.top
           anchors.left: parent.left
-          anchors.right: nameText.visible ? nameText.right : cell.right
+          // With a name: lead the digit and trail the last letter by the same amount.
+          // Without one: the cell already centres the digit, so the cell is the rule.
+          width: nameText.visible ? nameText.x + nameText.implicitWidth + lead : cell.width
           height: 2; color: root.fg; visible: slot.focused
         }
 

@@ -6,19 +6,21 @@ session is doing — because the workspaces are already there, already on screen
 one keystroke apart.
 
 ```
-▣  1 boxes-orbit   2 lovable   3 workspaces   4 ui-expert   5   ▶   X
-   ˙              ˙           ●              ˙
+               ▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+1 api-retry    2 checkout-bug    3 pdf-export    4 rag-eval    5    6
+·              ●                 ▂▂              ·
 ```
 
-Each workspace holding a Claude Code session shows a short name for it and a mark for what
-it is doing. A workspace with nothing in it stays a plain, dim number.
+Four pieces of work, one glance: the checkout bug is running, the PDF export is waiting on
+you, the API retry and the RAG eval are idle. A workspace with nothing in it stays a plain,
+dim number.
 
 ## What the marks mean
 
 | Mark | Meaning |
 |---|---|
-| A dot that breathes | the session is working |
-| A still, dim dot | the session is idle, waiting for you to type |
+| A bright dot | the session is working |
+| A dim dot | the session is idle, waiting for you to type |
 | A rule under the number | the session needs you: a permission prompt, an elicitation |
 | A rule above the number and name | this is the workspace you are on |
 
