@@ -64,32 +64,15 @@ other than your home directory, write `~/.config/omarchy/agent-workspaces.json`:
 { "launch": ["claude", "--dangerously-skip-permissions"], "cwd": "~/code" }
 ```
 
-It only ever closes a window it can tie to a session it started. A window it does not
-recognise is left alone, even if it is sitting in the workspace you are resetting.
-
-## Pinned workspaces
-
-A workspace can be pinned to an app: an icon replaces the number, and the app opens there.
-Put them in `~/.config/omarchy/workspace-names.json`:
+Workspace names you set yourself live in `~/.config/omarchy/workspace-names.json`, one line
+per workspace, and survive reboots:
 
 ```json
-{
-  "2": "rss-digest",
-  "7": { "icon": "youtube", "label": "YouTube" },
-  "8": { "icon": "x", "label": "X" }
-}
+{ "2": "rss-digest", "4": "matchstory" }
 ```
 
-Then add a Hyprland rule so the app always lands there, and an autostart line so it opens at
-login. `install` does not do this part for you — which app goes where is yours to choose.
-
-```lua
--- ~/.config/hypr/hyprland.lua
-o.window("^chrome-youtube\\.com__.*$", { workspace = "7 silent" })
-
--- ~/.config/hypr/autostart.lua
-o.exec_on_start(o.launch_webapp_sole("^chrome-youtube\\.com__.*$", "https://youtube.com/"))
-```
+It only ever closes a window it can tie to a session it started. A window it does not
+recognise is left alone, even if it is sitting in the workspace you are resetting.
 
 ## Install
 

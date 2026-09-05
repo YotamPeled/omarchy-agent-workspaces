@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "agentws.workspaces",
   "name": "Agent Workspaces",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "Yotam Peled",
   "description": "Workspace strip that shows what each Claude Code session is doing",
   "kinds": ["bar-widget"],

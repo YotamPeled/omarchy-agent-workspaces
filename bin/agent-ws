@@ -10,7 +10,7 @@
   agent-ws hook EVENT        Claude Code hook entry point (stdin JSON)
   agent-ws state             dump state (debug)
 
-Config  ~/.config/omarchy/workspace-names.json   {"2": "rss-digest", "7": {"icon": "youtube", ...}}
+Config  ~/.config/omarchy/workspace-names.json   {"2": "rss-digest"}   workspace id -> its name
 State   ~/.local/state/omarchy/agent-workspaces/  sessions.json · needs.json · slugs.json
 """
 import contextlib, fcntl, json, os, re, subprocess, sys, time, hashlib
@@ -104,31 +104,21 @@ def notify(title, body=""):
 # ---------- names / config ----------
 def config(): return load(CONFIG, {})
 
-def entry(ws):
-    """Config entry for a workspace id: {"name":..} for a manual name, pin dicts as-is, else None."""
-    e = config().get(str(ws))
-    if isinstance(e, str): return {"name": e} if e.strip() else None
-    return e if isinstance(e, dict) else None
-
 def ws_name(ws):
-    e = entry(ws)
-    return (e or {}).get("name") or (e or {}).get("label") or ""
+    """The name you gave a workspace, or "" if you never named it."""
+    e = config().get(str(ws))
+    return e.strip() if isinstance(e, str) else ""
 
 def set_name(ws, name):
-    """Never write over a config file we could not read: that would wipe every name and pin."""
+    """Never write over a config file we could not read: that would wipe every name."""
     with locked(CONFIG):
         try: c = load(CONFIG, {}, strict=True)
         except Corrupt:
             notify("Workspace names not saved",
                    "~/.config/omarchy/workspace-names.json is not valid JSON. Fix it first.")
             return False
-        k = str(ws); cur = c.get(k)
-        if isinstance(cur, dict):
-            if name: cur["name"] = name
-            else: cur.pop("name", None)
-            c[k] = cur
-        elif name: c[k] = name
-        else: c.pop(k, None)
+        if name: c[str(ws)] = name
+        else: c.pop(str(ws), None)
         save(CONFIG, c)
     return True
 
@@ -344,11 +334,10 @@ def cmd_name(sub, given=""):
                                     if v.get("open") or v.get("workspace") != ws})
         dispatch(f'hl.dsp.workspace.rename({{ workspace = {ws}, name = "{ws}" }})')
     elif sub == "apply":
-        # At login the pinned workspaces do not exist yet — their apps are still starting —
-        # so keep looking for the ones still missing for a minute.
-        want = {k: (v if isinstance(v, str) else v.get("name") or v.get("label", ""))
-                for k, v in config().items() if k.isdigit()}
-        want = {k: n for k, n in want.items() if n}
+        # At login a named workspace may not exist yet — whatever runs there is still
+        # starting — so keep looking for the ones still missing for a minute.
+        want = {k: v for k, v in config().items()
+                if k.isdigit() and isinstance(v, str) and v.strip()}
         for _ in range(13):
             live = {str(w["id"]) for w in (hypr("workspaces") or [])}
             for k in [k for k in want if k in live]:
@@ -402,8 +391,7 @@ def workspace_belongings(ws):
     return ws_name(ws), forget, list(here.values())
 
 def reset_workspace(ws):
-    """Bare number again: no name, no remembered sessions, no marks, no windows of ours.
-    A pin keeps its icon — that is configuration, not session state."""
+    """Bare number again: no name, no remembered sessions, no marks, no windows of ours."""
     _, forget, wins = workspace_belongings(ws)
     if set_name(ws, "") is False: return None
     update(SESSIONS, lambda s: {k: v for k, v in s.items() if k not in forget})
@@ -416,12 +404,8 @@ def reset_workspace(ws):
 
 def cmd_reset(args):
     every = "--all" in args
-    if every:
-        # Pinned workspaces are configuration, not session state; --all leaves them alone.
-        targets = sorted({w["id"] for w in (hypr("workspaces") or []) if w["id"] > 0}
-                         - {int(k) for k in config() if k.isdigit() and entry(k) and entry(k).get("icon")})
-    else:
-        targets = [focused_ws()]
+    targets = sorted({w["id"] for w in (hypr("workspaces") or []) if w["id"] > 0}) \
+              if every else [focused_ws()]
     if not targets: return
     names, forget, wins = set(), set(), 0
     for w in targets:

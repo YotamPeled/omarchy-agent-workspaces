@@ -5,7 +5,7 @@ import Quickshell.Hyprland
 import qs.Commons
 import qs.Ui
 
-// Agent workspaces: each slot is a fixed index cell (the number, or a pin icon) plus a
+// Agent workspaces: each slot is a fixed index cell (the workspace number) plus a
 // name tail when the workspace holds a Claude Code session. Session name and state come
 // from the terminal title Claude sets ("<glyph> <title>"); "needs you" from a hook flag.
 // Design: UI expert spec 2026-09-05. Colours are the bar's theme tokens only.
@@ -16,7 +16,7 @@ BarWidget {
   readonly property string home: Quickshell.env("HOME")
   readonly property string stateDir: (Quickshell.env("XDG_STATE_HOME") || home + "/.local/state") + "/omarchy/agent-workspaces"
 
-  property var config: ({})     // workspace-names.json: "2": "name" | {"icon","label","name","launch"}
+  property var config: ({})     // workspace-names.json: workspace id -> the name you gave it
   property var needs: ({})      // needs.json: window address -> timestamp
   property var slugs: ({})      // slugs.json: full title -> label (Haiku)
   property var local: ({})      // title -> heuristic label, from `agent-ws slug`
@@ -119,7 +119,6 @@ BarWidget {
       var id = v[i].id
       if (id > 0 && id <= 10 && ids.indexOf(id) === -1) ids.push(id)
     }
-    for (var k in root.config) { var n = parseInt(k); if (n > 0 && n <= 10 && ids.indexOf(n) === -1 && root.pinOf(n)) ids.push(n) }
     ids.sort(function(a, b) { return a - b })
     return ids
   }
@@ -129,15 +128,6 @@ BarWidget {
     return (e && typeof e === "object") ? e : null
   }
   function manualName(id) { var e = entry(id); return e && e.name ? String(e.name).slice(0, 14) : "" }
-  function pinOf(id) { var e = entry(id); return e && e.icon ? e : null }
-  function pinGlyph(icon) {
-    switch (String(icon)) {
-      case "youtube": return ""
-      case "container": return String.fromCodePoint(0xF01A7)
-      case "x": return "X"
-      default: return String(icon)
-    }
-  }
 
   // Sessions in a workspace: Claude windows, recognised by the status glyph in their title.
   function sessionsIn(ws) {
@@ -223,7 +213,6 @@ BarWidget {
   function forgetWidths() { root.widthAt = ({}) }
   function fullNameFor(id, sessions) {
     var m = manualName(id); if (m) return m
-    if (pinOf(id)) return ""
     var l = lead(sessions); return l ? label(l.title) : ""
   }
   function shown(name, level, state, focused) {
@@ -271,7 +260,6 @@ BarWidget {
         readonly property string wsState: root.worst(sessions)
         readonly property bool focused: Hyprland.focusedWorkspace !== null && Hyprland.focusedWorkspace.id === modelData
         readonly property bool occupied: workspace !== null && workspace.toplevels.values.length > 0
-        readonly property var pin: root.pinOf(modelData)
         readonly property string name: root.shown(root.fullNameFor(modelData, sessions), root.level, wsState, focused)
         readonly property bool loud: wsState === "needs"
 
@@ -279,16 +267,16 @@ BarWidget {
         height: root.barSize
         Behavior on width { enabled: root.animate; NumberAnimation { duration: 180; easing.type: Easing.OutCubic } }
 
-        // index cell: number or pin glyph, plus every mark
+        // index cell: the number, plus every mark
         Item {
           id: cell
           width: root.cellWidth; height: parent.height
 
           Text {
             anchors.centerIn: parent
-            text: slot.pin ? root.pinGlyph(slot.pin.icon) : (slot.modelData === 10 ? "0" : String(slot.modelData))
+            text: slot.modelData === 10 ? "0" : String(slot.modelData)
             font.family: root.bar ? root.bar.fontFamily : Style.font.family
-            font.pixelSize: slot.pin && slot.pin.icon !== "x" ? Style.bar.iconFont : Style.font.body
+            font.pixelSize: Style.font.body
             color: slot.loud ? root.loud : root.fg
             opacity: slot.occupied || slot.focused ? 1 : 0.5
             Behavior on color { enabled: root.animate; ColorAnimation { duration: 160 } }
@@ -348,8 +336,7 @@ BarWidget {
         function tooltip() {
           var head = String(modelData)
           var mn = root.manualName(modelData); if (mn) head += " · " + mn
-          else if (pin) head += " · " + (pin.label || pin.icon)
-          if (sessions.length === 0) return (mn || pin) ? head : ""
+          if (sessions.length === 0) return mn ? head : ""
           var order = { needs: 0, working: 1, idle: 2 }
           var ss = sessions.slice().sort(function(a, b) { return (order[a.state] - order[b.state]) || (b.last - a.last) })
           var lines = [head]
