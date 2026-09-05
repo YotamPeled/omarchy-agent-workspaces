@@ -81,5 +81,13 @@ run install >/dev/null; run uninstall >/dev/null
 check "theirs is put back" "$(cat "$S/.local/bin/agent-ws")" "#!/bin/sh"
 rm -rf "$S"
 
+echo "the keybinding block releases Omarchy's own Super+Shift+A"
+newhome; run install >/dev/null
+check "unbinds ChatGPT before binding Claude" \
+  "$(grep -c 'hl.unbind("SUPER + SHIFT + A")' "$S/.config/hypr/bindings.lua")" "1"
+check "and the unbind comes first" \
+  "$(awk '/hl.unbind\("SUPER \+ SHIFT \+ A"\)/{u=NR} /o.bind\("SUPER \+ SHIFT \+ A"/{b=NR} END{print (u<b)?"yes":"no"}' "$S/.config/hypr/bindings.lua")" "yes"
+rm -rf "$S"
+
 echo
 if ((fail)); then echo "$fail failed, $pass passed"; exit 1; else echo "all $pass checks passed"; fi

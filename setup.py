@@ -36,7 +36,9 @@ o.bind("SUPER + R", "Name workspace", "agent-ws name set")
 -- Forget the name. The sessions and windows stay.
 o.bind("SUPER + SHIFT + R", "Clear workspace name", "agent-ws name clear")
 -- In a named workspace, bring back the sessions it remembers. Press it again once they are
--- open and you get a fresh one alongside them.
+-- open and you get a fresh one alongside them. Omarchy binds this key to ChatGPT and its
+-- defaults load first, so the old binding has to go or Hyprland fires that one instead.
+hl.unbind("SUPER + SHIFT + A")
 o.bind("SUPER + SHIFT + A", "Agent", "agent-ws launch")
 -- Bigger hammer: forget the name, forget what the workspace remembered, close its Claude
 -- windows. Asks first, because closing the windows is the part you cannot get back.
