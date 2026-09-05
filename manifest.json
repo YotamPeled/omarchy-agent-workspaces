@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "id": "agentws.workspaces",
+  "name": "Agent Workspaces",
+  "version": "1.0.0",
+  "author": "Yotam Peled",
+  "description": "Workspace strip that shows what each Claude Code session is doing",
+  "kinds": ["bar-widget"],
+  "entryPoints": { "barWidget": "Workspaces.qml" },
+  "barWidget": {
+    "displayName": "Agent Workspaces",
+    "description": "Each workspace shows the name of the Claude Code session in it and whether it is working, idle, or waiting on you",
+    "category": "Compositor",
+    "defaultSection": "left",
+    "allowMultiple": false
+  }
+}

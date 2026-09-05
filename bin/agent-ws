@@ -1,0 +1,444 @@
+#!/usr/bin/env python3
+"""Agent workspaces: Hyprland workspaces as the Claude Code harness.
+
+  agent-ws name set [NAME]   name the workspace; without NAME, prompt (Enter = accept the suggested slug)
+  agent-ws name clear        remove the focused workspace's name (and forget its sessions)
+  agent-ws name apply        push stored names into Hyprland (login)
+  agent-ws launch            Super+Shift+A: resume the workspace's remembered sessions, else fresh
+  agent-ws reset [--all]     put the workspace back to a bare number: no name, nothing remembered
+  agent-ws slug TITLE        print the short label for a session title (heuristic, then cached AI)
+  agent-ws hook EVENT        Claude Code hook entry point (stdin JSON)
+  agent-ws state             dump state (debug)
+
+Config  ~/.config/omarchy/workspace-names.json   {"2": "rss-digest", "7": {"icon": "youtube", ...}}
+State   ~/.local/state/omarchy/agent-workspaces/  sessions.json · needs.json · slugs.json
+"""
+import contextlib, fcntl, json, os, re, subprocess, sys, time, hashlib
+
+HOME = os.path.expanduser("~")
+CONFIG = f"{HOME}/.config/omarchy/workspace-names.json"
+STATE = os.environ.get("XDG_STATE_HOME", f"{HOME}/.local/state") + "/omarchy/agent-workspaces"
+SESSIONS, NEEDS, SLUGS = (f"{STATE}/{n}.json" for n in ("sessions", "needs", "slugs"))
+GLYPHS = "◐◑◒◓✳"
+NEEDS_TYPES = ("permission_prompt", "agent_needs_input", "elicitation")  # idle_prompt is just idle
+NEEDS_TTL = 3600      # Hyprland reuses window addresses, so a flag must not outlive its window
+SLUG_CAP = 2000       # one entry per session title ever seen; bounded so the file cannot grow forever
+LOG_CAP = 262144
+
+# ---------- small io ----------
+class Corrupt(Exception):
+    """The file is there but is not JSON. Never overwrite one of these."""
+
+def load(path, default, strict=False):
+    try:
+        with open(path) as f: text = f.read()
+    except OSError: return default
+    if not text.strip(): return default      # nothing written yet: not a corrupt file
+    try: return json.loads(text)
+    except ValueError:
+        if strict: raise Corrupt(path)
+        return default
+
+def save(path, data, sort=True):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.tmp"      # per-process: two writers must not share one
+    with open(tmp, "w") as f: json.dump(data, f, indent=2, sort_keys=sort)
+    os.replace(tmp, path)
+
+def lock_path(path):
+    """Locks live in the state dir so they never litter ~/.config, which is hand-edited."""
+    return f"{STATE}/locks/{re.sub(r'[^A-Za-z0-9]+', '_', path)}.lock"
+
+@contextlib.contextmanager
+def locked(path):
+    """Hold an exclusive lock on a state file across read-modify-write.
+
+    Hooks fire on every tool call and Super+Shift+A starts every remembered session at
+    once, so unsynchronised read-modify-write silently loses records."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    lp = lock_path(path); os.makedirs(os.path.dirname(lp), exist_ok=True)
+    with open(lp, "w") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        yield
+
+def update(path, fn, default=None):
+    """Read, apply fn, write back, all under the file's lock. fn returns the new value."""
+    with locked(path):
+        cur = load(path, {} if default is None else default)
+        new = fn(cur)
+        if new is not None: save(path, new)
+        return new
+
+def hypr(*args):
+    out = subprocess.run(["hyprctl", "-j", *args], capture_output=True, text=True).stdout
+    return json.loads(out) if out.strip() else None
+
+def dispatch(lua):
+    subprocess.run(["hyprctl", "dispatch", lua], capture_output=True)
+
+def is_print_run():
+    """True for `claude -p`. Those fire the same hooks but own no window, so without this
+    they get filed against whatever terminal happens to be up the process tree."""
+    if os.environ.get("AGENT_WS_INTERNAL"): return True
+    pid = os.getppid()
+    for _ in range(8):
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                args = [a.decode("utf-8", "replace") for a in f.read().split(b"\0") if a]
+        except OSError: return False
+        if any(os.path.basename(a).startswith("claude") for a in args[:2]):
+            return any(a in ("-p", "--print") for a in args)
+        try:
+            with open(f"/proc/{pid}/stat") as f: pid = int(f.read().split(")")[-1].split()[1])
+        except (OSError, ValueError): return False
+        if pid <= 1: return False
+    return False
+
+def norm_addr(a):
+    """Hyprland gives "0x55..." over hyprctl and bare over the event socket; store bare."""
+    return str(a or "").removeprefix("0x").lower()
+
+def notify(title, body=""):
+    subprocess.run(["omarchy-notification-send", title, body], capture_output=True)
+
+# ---------- names / config ----------
+def config(): return load(CONFIG, {})
+
+def entry(ws):
+    """Config entry for a workspace id: {"name":..} for a manual name, pin dicts as-is, else None."""
+    e = config().get(str(ws))
+    if isinstance(e, str): return {"name": e} if e.strip() else None
+    return e if isinstance(e, dict) else None
+
+def ws_name(ws):
+    e = entry(ws)
+    return (e or {}).get("name") or (e or {}).get("label") or ""
+
+def set_name(ws, name):
+    """Never write over a config file we could not read: that would wipe every name and pin."""
+    with locked(CONFIG):
+        try: c = load(CONFIG, {}, strict=True)
+        except Corrupt:
+            notify("Workspace names not saved",
+                   "~/.config/omarchy/workspace-names.json is not valid JSON. Fix it first.")
+            return False
+        k = str(ws); cur = c.get(k)
+        if isinstance(cur, dict):
+            if name: cur["name"] = name
+            else: cur.pop("name", None)
+            c[k] = cur
+        elif name: c[k] = name
+        else: c.pop(k, None)
+        save(CONFIG, c)
+    return True
+
+# ---------- windows ----------
+def focused_ws(): return hypr("activeworkspace")["id"]
+
+def window_for_process(pid=None):
+    """Walk up the process tree until a pid owns a Hyprland window."""
+    clients = {c["pid"]: c for c in (hypr("clients") or [])}
+    pid = pid or os.getpid()
+    for _ in range(40):
+        if pid in clients: return clients[pid]
+        try:
+            with open(f"/proc/{pid}/stat") as f: pid = int(f.read().split(")")[-1].split()[1])
+        except (OSError, ValueError): break
+        if pid <= 1: break
+    return None
+
+def session_windows(ws=None):
+    """Claude windows (title carries a status glyph), optionally in one workspace."""
+    # `"" in GLYPHS` is True, so an untitled window would count as a session. Require a glyph.
+    return [c for c in (hypr("clients") or [])
+            if (c.get("title") or "")[:1] and c["title"][0] in GLYPHS
+            and (ws is None or c["workspace"]["id"] == ws)]
+
+# ---------- slugs ----------
+STOP = set("""a an the and or of to for in on at by with from into over under as is are was be been being
+this that these those it its my our your their his her you we i me us them via vs per about after before
+during without within between across through up down out off than then so if when while where how what
+which who whom whose""".split())
+GENERIC = set("""add fix make update create build implement refactor review investigate debug migrate setup set
+remove delete clean improve test write plan check run port wire ship handle support enable disable change
+move rename use work try get allow ensure access finish complete project code issue task bug thing file
+app page site repo branch commit error problem infrastructure infra feature config version system stuff
+session chat new""".split())
+
+def strip_glyph(title):
+    t = title.strip()
+    return t[1:].strip() if t[:1] in GLYPHS else t
+
+def heuristic_slug(title):
+    words = re.findall(r"[a-z0-9][a-z0-9.\-]*", strip_glyph(title).lower())
+    keep = [w for w in words if w not in STOP and w not in GENERIC] or words[:2]
+    if not keep: return ""
+    two = " ".join(keep[:2])
+    return two if len(two) <= 13 else keep[0][:10]
+
+def slug(title, ai=True):
+    """Heuristic now; a cached Haiku label if one exists; kick off Haiku in the background otherwise."""
+    title = strip_glyph(title)
+    if not title: return ""
+    cache = load(SLUGS, {})
+    if title in cache: return cache[title]
+    if ai and not os.environ.get("AGENT_WS_NO_AI"):
+        subprocess.Popen([sys.argv[0], "slug", "--ai", title], stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+    return heuristic_slug(title)
+
+def ai_slug(title):
+    cache = load(SLUGS, {})
+    if title in cache: return cache[title]
+    # One Haiku call per title, ever: a marker stops a second caller racing this one.
+    mark = f"{STATE}/inflight/{hashlib.sha1(title.encode()).hexdigest()}"
+    os.makedirs(os.path.dirname(mark), exist_ok=True)
+    try:
+        if time.time() - os.path.getmtime(mark) < 180: return ""
+    except OSError: pass
+    open(mark, "w").close()
+    prompt = (
+        "This is the title of a coding session running in one workspace of my desktop. "
+        "Name that workspace so I can tell at a glance which session it is.\n\n"
+        "Rules:\n"
+        "- At most 13 characters. Lowercase. Letters, digits and hyphens only.\n"
+        "- One or two words; a hyphen only inside a name that is really one word.\n"
+        "- Name the thing worked on: the project, tool, file or feature. "
+        "Never the verb, never the person.\n"
+        "- Drop filler words: setup, question, issue, help, understanding, design, demo, "
+        "project, app.\n"
+        "- Keep proper nouns spelled as they are written in the title.\n\n"
+        "Output only the name, nothing else.\n\nTitle: " + title)
+    try:
+        out = subprocess.run(["claude", "-p", "--model", "haiku", "--no-session-persistence",
+                              "--strict-mcp-config", prompt],
+                             capture_output=True, text=True, timeout=90,
+                             env={**os.environ, "AGENT_WS_INTERNAL": "1"}).stdout.strip().splitlines()
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    finally:
+        try: os.remove(mark)
+        except OSError: pass
+    label = re.sub(r"[^a-z0-9 \-]", "", (out[0] if out else "").lower()).strip()
+    if 0 < len(label) <= 14:
+        def add(c):
+            c[title] = label
+            while len(c) > SLUG_CAP: c.pop(next(iter(c)))   # oldest first; insertion order kept
+            return c
+        with locked(SLUGS):
+            c = add(load(SLUGS, {})); save(SLUGS, c, sort=False)
+        return label
+    return ""
+
+# ---------- sessions ----------
+def sessions(): return load(SESSIONS, {})
+
+def resumable(transcript):
+    """`claude --resume` needs a transcript on disk; an unused session leaves none."""
+    try: return bool(transcript) and os.path.getsize(transcript) > 0
+    except OSError: return False
+
+def remember(sid, **fields):
+    def f(s):
+        rec = s.get(sid, {}); rec.update(fields); s[sid] = rec; return s
+    update(SESSIONS, f)
+
+def forget(sid):
+    update(SESSIONS, lambda s: (s.pop(sid, None), s)[1])
+
+KEEP_DAYS = 30
+
+def keepable(rec):
+    """Keep anything still resumable. A transcript on disk is the whole test: the workspace
+    may be unnamed now and named later, and then Super+Shift+A should still find it."""
+    if rec.get("open"): return True
+    if not resumable(rec.get("transcript", "")): return False
+    return time.time() - rec.get("ended", 0) < KEEP_DAYS * 86400
+
+def prune():
+    update(SESSIONS, lambda s: {k: v for k, v in s.items() if keepable(v)})
+
+def needs_write(fn):
+    def f(n):
+        cut = time.time() - NEEDS_TTL
+        n = {k: v for k, v in n.items()
+             if (v.get("at", 0) if isinstance(v, dict) else v) > cut}
+        return fn(n)
+    return update(NEEDS, f)
+
+def adopt_open_sessions(ws, name):
+    """Naming a workspace claims its sessions — the open ones and anything that closed in
+    it recently, so naming a workspace after the fact still brings those back."""
+    def f(s):
+        for rec in s.values():
+            if rec.get("workspace") != ws: continue
+            if rec.get("open") or time.time() - rec.get("ended", 0) < KEEP_DAYS * 86400:
+                rec["name"] = name
+        return s
+    update(SESSIONS, f)
+
+# ---------- hooks ----------
+def hook(event):
+    # A headless `claude -p` fires these hooks too but owns no window, so without this it
+    # gets filed against whatever terminal happens to be up its process tree.
+    if is_print_run(): return
+    data = json.load(sys.stdin) if not sys.stdin.isatty() else {}
+    sid = data.get("session_id", "")
+    if event == "session-start":
+        win = window_for_process()
+        if not win or not sid: return
+        ws = win["workspace"]["id"]
+        remember(sid, cwd=data.get("cwd", ""), workspace=ws, name=ws_name(ws), open=True,
+                 address=norm_addr(win["address"]), pid=win["pid"], started=time.time(),
+                 transcript=data.get("transcript_path", ""))
+    elif event == "session-end":
+        if not sid: return
+        # /exit is a deliberate end: forget. A closed window keeps the session resumable
+        # as long as Claude left a transcript; prune() below drops it if not, and launch
+        # re-checks, because Claude may still be flushing while this hook runs.
+        tp = data.get("transcript_path") or sessions().get(sid, {}).get("transcript", "")
+        if data.get("reason") == "prompt_input_exit": forget(sid)
+        elif sid in sessions(): remember(sid, open=False, ended=time.time(), transcript=tp)
+        # A flag raised by this session dies with it: Hyprland hands the address straight to
+        # the next window, which would otherwise inherit the loud mark.
+        needs_write(lambda n: {k: v for k, v in n.items()
+                               if not (isinstance(v, dict) and v.get("sid") == sid)})
+        prune()
+    elif event == "notification":
+        if str(data.get("notification_type", "")).startswith(NEEDS_TYPES):
+            win = window_for_process()
+            if win:
+                a = norm_addr(win["address"])
+                needs_write(lambda n: {**n, a: {"at": time.time(), "sid": sid}})
+    elif event in ("prompt-submit", "pre-tool"):
+        if not load(NEEDS, {}): return          # cheap exit: fires on every tool call
+        win = window_for_process()
+        if win:
+            a = norm_addr(win["address"])
+            needs_write(lambda n: {k: v for k, v in n.items()
+                                   if k != a and not (isinstance(v, dict) and v.get("sid") == sid)})
+
+# ---------- commands ----------
+def cmd_name(sub, given=""):
+    ws = focused_ws()
+    if sub == "set":
+        wins = session_windows(ws)
+        suggested = ws_name(ws) or (slug(wins[0]["title"]) if wins else "")
+        if given:                                # `agent-ws name set NAME`, no prompt
+            name = re.sub(r'["\\]', "", given.strip())[:14]
+        else:
+            hint = f" (Enter = {suggested})" if suggested else ""
+            r = subprocess.run(["omarchy", "menu", "input", f"Name workspace {ws}{hint}", "--width", "420"],
+                               capture_output=True, text=True)
+            if r.returncode != 0: return
+            name = re.sub(r'["\\]', "", r.stdout.strip())[:14] or suggested
+        if not set_name(ws, name): return
+        if name:
+            adopt_open_sessions(ws, name)
+            dispatch(f'hl.dsp.workspace.rename({{ workspace = {ws}, name = "{name}" }})')
+    elif sub == "clear":
+        if not set_name(ws, ""): return
+        # Forget only this workspace's closed sessions. Two workspaces can share a name, and
+        # an open session belongs to its window, not to the label.
+        update(SESSIONS, lambda s: {k: v for k, v in s.items()
+                                    if v.get("open") or v.get("workspace") != ws})
+        dispatch(f'hl.dsp.workspace.rename({{ workspace = {ws}, name = "{ws}" }})')
+    elif sub == "apply":
+        # At login the pinned workspaces do not exist yet — their apps are still starting —
+        # so keep looking for the ones still missing for a minute.
+        want = {k: (v if isinstance(v, str) else v.get("name") or v.get("label", ""))
+                for k, v in config().items() if k.isdigit()}
+        want = {k: n for k, n in want.items() if n}
+        for _ in range(13):
+            live = {str(w["id"]) for w in (hypr("workspaces") or [])}
+            for k in [k for k in want if k in live]:
+                dispatch(f'hl.dsp.workspace.rename({{ workspace = {k}, name = "{want.pop(k)}" }})')
+            if not want: break
+            time.sleep(5)
+    elif sub == "list":
+        print(json.dumps(config(), indent=2))
+
+# Session-scoped vars Claude Code exports to its children. Inheriting them makes the
+# new window a *child* session, which never writes a transcript and so can never be
+# resumed. Strip them so a session launched from inside Claude is a real one.
+CHILD_ENV = ("CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_ENTRYPOINT",
+             "CLAUDE_CODE_MESSAGING_SOCKET", "CLAUDE_CODE_MESSAGING_TOKEN",
+             "CLAUDE_CODE_BRIDGE_SESSION_ID", "CLAUDE_CODE_EXECPATH", "CLAUDE_PID",
+             "CLAUDE_EFFORT", "CLAUDECODE", "AI_AGENT")
+
+def launch_claude(cwd, *args):
+    env = {k: v for k, v in os.environ.items() if k not in CHILD_ENV}
+    subprocess.Popen(["omarchy-launch-tui", "--app-id=org.omarchy.agent", "claude-yolo", *args],
+                     cwd=cwd if os.path.isdir(cwd) else None, start_new_session=True, env=env,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+def reset_workspace(ws):
+    """Bare number again: no name, no remembered sessions, no marks, no windows.
+    A pin keeps its icon — that is configuration, not session state."""
+    wins = session_windows(ws)
+    if set_name(ws, "") is False: return None
+    update(SESSIONS, lambda s: {k: v for k, v in s.items() if v.get("workspace") != ws})
+    gone = {norm_addr(w["address"]) for w in wins}
+    needs_write(lambda n: {k: v for k, v in n.items() if norm_addr(k) not in gone})
+    dispatch(f'hl.dsp.workspace.rename({{ workspace = {ws}, name = "{ws}" }})')
+    for w in wins:
+        dispatch(f'hl.dsp.window.close({{ window = "address:{w["address"]}" }})')
+    return len(wins)
+
+def cmd_reset(args):
+    every = "--all" in args
+    targets = ([w["id"] for w in (hypr("workspaces") or []) if w["id"] > 0]
+               if every else [focused_ws()])
+    targets = sorted(set(targets))
+    if not targets: return
+    n = sum(len(session_windows(w)) for w in targets)
+    if n and "--force" not in args:
+        what = "every workspace" if every else f"workspace {targets[0]}"
+        r = subprocess.run(["omarchy", "menu", "select",
+                            f"Reset {what}? {n} Claude window(s) will close", "Cancel", "Reset"],
+                           capture_output=True, text=True)
+        if r.returncode != 0 or r.stdout.strip() != "Reset": return
+    for w in targets: reset_workspace(w)
+    notify("Workspace reset", "every workspace" if every else f"workspace {targets[0]}")
+
+def cmd_launch():
+    ws = focused_ws(); name = ws_name(ws)
+    closed = [(sid, r) for sid, r in sessions().items()
+              if name and r.get("name") == name and not r.get("open")] if name else []
+    # A transcript can vanish between close and resume; drop those rather than
+    # launch a terminal that dies on "No conversation found".
+    gone = {sid for sid, r in closed if not resumable(r.get("transcript", ""))}
+    if gone:
+        update(SESSIONS, lambda s: {k: v for k, v in s.items() if k not in gone})
+        closed = [(sid, r) for sid, r in closed if sid not in gone]
+    if closed:
+        for sid, r in sorted(closed, key=lambda x: x[1].get("ended", 0)):
+            launch_claude(r.get("cwd", ""), "--resume", sid)
+        notify("Resuming sessions", f"{len(closed)} in {name}")
+    else:
+        launch_claude("")
+
+def main():
+    a = sys.argv[1:]
+    if not a: print(__doc__); sys.exit(1)
+    if a[0] == "hook" and len(a) > 1: hook(a[1])
+    elif a[0] == "name" and len(a) > 1: cmd_name(a[1], " ".join(a[2:]))
+    elif a[0] == "launch": cmd_launch()
+    elif a[0] == "reset": cmd_reset(a[1:])
+    elif a[0] == "slug" and len(a) > 1:
+        if a[1] == "--ai": print(ai_slug(" ".join(a[2:])))
+        else: print(slug(" ".join(a[1:])))
+    elif a[0] == "log":
+        os.makedirs(STATE, exist_ok=True)
+        path = f"{STATE}/debug.log"
+        try:
+            if os.path.getsize(path) > LOG_CAP: os.replace(path, path + ".1")
+        except OSError: pass
+        with open(path, "a") as f:
+            f.write(time.strftime("%H:%M:%S ") + " ".join(a[1:]) + "\n")
+    elif a[0] == "state":
+        print(json.dumps({"config": config(), "sessions": sessions(), "needs": load(NEEDS, {}),
+                          "slugs": load(SLUGS, {})}, indent=2))
+    else: print(__doc__); sys.exit(1)
+
+if __name__ == "__main__": main()

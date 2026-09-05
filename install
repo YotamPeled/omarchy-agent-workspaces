@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Agent Workspaces installer. Safe to run more than once: it adds what is missing and
+# leaves everything else alone. `./uninstall` reverses every step.
+set -euo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec python3 "$HERE/setup.py" install "$HERE" "$@"
