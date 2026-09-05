@@ -295,24 +295,10 @@ BarWidget {
             Behavior on opacity { enabled: root.animate; NumberAnimation { duration: 160 } }
           }
           Rectangle {   // working / idle
-            id: dot
-            // A working session breathes; idle sits still and dim. `pulse` is a separate
-            // multiplier so the state binding below survives the animation.
-            property real pulse: 1
             anchors.bottom: parent.bottom; anchors.bottomMargin: Style.space(4); anchors.horizontalCenter: parent.horizontalCenter
             width: 3; height: 3; radius: 1.5; color: root.fg
-            opacity: (slot.wsState === "working" ? 1 : (slot.wsState === "idle" ? 0.5 : 0)) * pulse
-            Behavior on opacity {
-              enabled: root.animate && slot.wsState !== "working"
-              NumberAnimation { duration: 160 }
-            }
-            SequentialAnimation {
-              running: slot.wsState === "working" && root.animate
-              loops: Animation.Infinite
-              onStopped: dot.pulse = 1
-              NumberAnimation { target: dot; property: "pulse"; from: 1; to: 0.25; duration: 650; easing.type: Easing.InOutSine }
-              NumberAnimation { target: dot; property: "pulse"; from: 0.25; to: 1; duration: 650; easing.type: Easing.InOutSine }
-            }
+            opacity: slot.wsState === "working" ? 1 : (slot.wsState === "idle" ? 0.5 : 0)
+            Behavior on opacity { enabled: root.animate; NumberAnimation { duration: 160 } }
           }
           Rectangle {   // needs you
             anchors.bottom: parent.bottom; anchors.left: parent.left; anchors.right: parent.right
