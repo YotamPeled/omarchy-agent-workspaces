@@ -19,7 +19,8 @@ HOME="$S" AGENT_WS_NO_RELOAD=1 "$HERE/install" >/dev/null
 HOME="$S" AGENT_WS_NO_RELOAD=1 "$HERE/install" | grep -q "already there" || { echo "FAIL: second install was not a no-op"; exit 1; }
 HOME="$S" AGENT_WS_NO_RELOAD=1 "$HERE/uninstall" >/dev/null
 
-diff -r "$S.before" "$S" --exclude='*.json' >/dev/null || { echo "FAIL: files left behind"; exit 1; }
+# the state directory is deliberately left behind; everything else must be as it was
+diff -r "$S.before" "$S" --exclude='*.json' --exclude=state >/dev/null || { echo "FAIL: files left behind"; exit 1; }
 python3 - "$S" <<'P'
 import json, sys
 s = sys.argv[1]

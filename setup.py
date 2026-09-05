@@ -18,6 +18,10 @@ SHELL_JSON = f"{HOME}/.config/omarchy/shell.json"
 BINDINGS = f"{HOME}/.config/hypr/bindings.lua"
 AUTOSTART = f"{HOME}/.config/hypr/autostart.lua"
 BEGIN, END = "-- >>> agent-workspaces", "-- <<< agent-workspaces"
+NOTE = "-- Managed by Agent Workspaces. Edits inside this block are lost on reinstall."
+STATE = f"{HOME}/.local/state/omarchy/agent-workspaces"
+RECORD = f"{STATE}/install.json"          # what we changed, so uninstall can undo just that
+HOOK_TIMEOUT = 10
 
 HOOKS = {                                    # Claude Code event -> agent-ws subcommand
     "SessionStart": "session-start", "SessionEnd": "session-end",
@@ -26,6 +30,7 @@ HOOKS = {                                    # Claude Code event -> agent-ws sub
 }
 
 BINDINGS_BLOCK = f"""{BEGIN}
+{NOTE}
 -- Name the workspace you are on. Enter accepts the name suggested from the session title.
 o.bind("SUPER + R", "Name workspace", "agent-ws name set")
 -- Forget the name. The sessions and windows stay.
@@ -39,13 +44,33 @@ o.bind("SUPER + SHIFT + ALT + R", "Reset workspace", "agent-ws reset")
 {END}"""
 
 AUTOSTART_BLOCK = f"""{BEGIN}
+{NOTE}
 -- Hyprland forgets workspace names when it restarts; put the saved ones back.
 o.launch_on_start("agent-ws name apply")
 {END}"""
 
 
 # ---------- small helpers ----------
+class Bad(Exception):
+    """The file is there but is not JSON. Never write over one of these."""
+
 def say(*a): print(" ", *a)
+
+def step(fn, *a):
+    """Run one step. A step that cannot read its file says so and lets the others run."""
+    try: return fn(*a)
+    except Bad as e: return f"skipped: {e.args[0]} is not valid JSON, fix it and run again"
+
+def record(**kw):
+    os.makedirs(STATE, exist_ok=True)
+    r = {}
+    try: r = json.load(open(RECORD))
+    except (OSError, ValueError): pass
+    r.update(kw); write_json(RECORD, r)
+
+def recorded(key, default=None):
+    try: return json.load(open(RECORD)).get(key, default)
+    except (OSError, ValueError): return default
 
 def read_json(path, default):
     try:
@@ -53,8 +78,7 @@ def read_json(path, default):
     except OSError: return default
     if not text.strip(): return default
     try: return json.loads(text)
-    except ValueError:
-        sys.exit(f"{path} is not valid JSON. Fix it first; refusing to write over it.")
+    except ValueError: raise Bad(path)
 
 def write_json(path, data):
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -62,94 +86,163 @@ def write_json(path, data):
     with open(tmp, "w") as f: json.dump(data, f, indent=2); f.write("\n")
     os.replace(tmp, path)
 
+def markers_ok(cur, path):
+    b, e = cur.count(BEGIN), cur.count(END)
+    if b == e and b <= 1: return True
+    print(f"    the {BEGIN} / {END} markers in {path} are {b} and {e}; "
+          "remove the block by hand and run again")
+    return False
+
 def block(path, text):
     """Add our marked block to a file, or replace the one already there."""
     cur = open(path).read() if os.path.exists(path) else ""
+    if not markers_ok(cur, path): return "skipped, markers are damaged"
     if BEGIN in cur:
         new = re.sub(re.escape(BEGIN) + r".*?" + re.escape(END), text, cur, flags=re.S)
     else:
         new = cur.rstrip("\n") + "\n\n" + text + "\n"
-    if new != cur:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        open(path, "w").write(new)
-        return True
-    return False
+    if new == cur: return "already there"
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    open(path, "w").write(new)
+    return "added"
 
 def unblock(path):
-    if not os.path.exists(path): return False
+    if not os.path.exists(path): return "none found"
     cur = open(path).read()
+    if not markers_ok(cur, path): return "skipped, markers are damaged"
     new = re.sub(r"\n*" + re.escape(BEGIN) + r".*?" + re.escape(END) + r"\n*", "\n", cur, flags=re.S)
-    if new != cur:
-        open(path, "w").write(new)
-        return True
-    return False
+    if new == cur: return "none found"
+    open(path, "w").write(new)
+    return "removed"
 
 
 # ---------- the pieces ----------
+def our_entry(sub):
+    return {"matcher": "*",
+            "hooks": [{"type": "command", "command": f"agent-ws hook {sub}",
+                       "timeout": HOOK_TIMEOUT}]}
+
 def hooks_install():
-    """Add our five hooks. Anything already in settings.json is left exactly as it is."""
+    """Add our five hooks. Anything already in settings.json is left exactly as it is —
+    including a hook of the user's own that happens to call agent-ws."""
+    existed = os.path.exists(SETTINGS) and open(SETTINGS).read().strip()
     s = read_json(SETTINGS, {})
     hooks = s.setdefault("hooks", {})
-    added = 0
+    added = []
     for event, sub in HOOKS.items():
-        cmd = f"agent-ws hook {sub}"
         entries = hooks.setdefault(event, [])
-        if any(cmd == h.get("command") for e in entries for h in e.get("hooks", [])):
-            continue
-        entries.append({"matcher": "*",
-                        "hooks": [{"type": "command", "command": cmd, "timeout": 10}]})
-        added += 1
-    if added: write_json(SETTINGS, s)
-    return added
+        if our_entry(sub) in entries: continue
+        entries.append(our_entry(sub))
+        added.append(event)
+    if added:
+        write_json(SETTINGS, s)
+        record(hooks=sorted(set(recorded("hooks", []) + added)),
+               settings_made=bool(recorded("settings_made")) or not existed)
+    return f"added {len(added)}" if added else "already there"
 
 def hooks_remove():
+    """Take out exactly the entries install put in. A hook of the user's own that calls
+    agent-ws is theirs, not ours, and stays."""
     s = read_json(SETTINGS, {})
     hooks = s.get("hooks", {})
+    if not isinstance(hooks, dict): return "nothing to remove"
     removed = 0
-    for event in list(hooks):
-        keep = []
-        for entry in hooks[event]:
-            inner = [h for h in entry.get("hooks", [])
-                     if not str(h.get("command", "")).startswith("agent-ws hook ")]
-            if len(inner) != len(entry.get("hooks", [])): removed += 1
-            if inner:
-                entry["hooks"] = inner
-                keep.append(entry)
+    for event, sub in HOOKS.items():
+        entries = hooks.get(event)
+        if not isinstance(entries, list): continue
+        keep = [e for e in entries if e != our_entry(sub)]
+        removed += len(entries) - len(keep)
         if keep: hooks[event] = keep
         else: hooks.pop(event)
     if removed:
         if not hooks: s.pop("hooks", None)
-        write_json(SETTINGS, s)
-    return removed
+        if recorded("settings_made") and not s: remove_file(SETTINGS)
+        else: write_json(SETTINGS, s)
+    return f"removed {removed}" if removed else "none of ours found"
+
+def prune_empty(s, made):
+    """Drop the containers install had to invent, if nothing else moved into them."""
+    if "left" in made and s.get("bar", {}).get("layout", {}).get("left") == []:
+        s["bar"]["layout"].pop("left")
+    if "layout" in made and s.get("bar", {}).get("layout") == {}: s["bar"].pop("layout")
+    if "bar" in made and s.get("bar") == {}: s.pop("bar")
+
+def remove_file(path):
+    try: os.remove(path)
+    except OSError: pass
+
+def sections(s):
+    layout = s.get("bar", {}).get("layout", {})
+    if not isinstance(layout, dict): return []
+    return [(k, v) for k, v in layout.items() if isinstance(v, list)]
+
+def widget_id(w): return w.get("id") if isinstance(w, dict) else w
 
 def bar_install():
-    """Put our widget where Omarchy's workspace strip was, without disturbing the rest."""
+    """Take over Omarchy's workspace strip wherever it is, and write down exactly what we
+    replaced — and which containers we had to invent — so uninstall puts back just that."""
+    existed = os.path.exists(SHELL_JSON)
     s = read_json(SHELL_JSON, {})
+    for name, items in sections(s):
+        if any(widget_id(w) == PLUGIN_ID for w in items): return "already placed"
+    for name, items in sections(s):
+        for i, w in enumerate(items):
+            if widget_id(w) == "omarchy.workspaces":
+                items[i] = {"id": PLUGIN_ID}
+                write_json(SHELL_JSON, s)
+                record(bar={"section": name, "index": i, "replaced": w})
+                return f"replaced Omarchy's strip in the {name} section"
+    made = [k for k in ("bar", "layout", "left")
+            if k not in (s if k == "bar" else s.get("bar", {}) if k == "layout"
+                         else s.get("bar", {}).get("layout", {}))]
     left = s.setdefault("bar", {}).setdefault("layout", {}).setdefault("left", [])
-    ids = [w.get("id") if isinstance(w, dict) else w for w in left]
-    if PLUGIN_ID in ids: return False
-    stock = next((i for i, w in enumerate(ids) if w == "omarchy.workspaces"), None)
-    if stock is not None: left[stock] = {"id": PLUGIN_ID}
-    else: left.append({"id": PLUGIN_ID})
+    if not isinstance(left, list): return "skipped: bar.layout.left is not a list"
+    left.append({"id": PLUGIN_ID})
     write_json(SHELL_JSON, s)
-    return True
+    record(bar={"section": "left", "index": len(left) - 1, "replaced": None,
+                "made": made, "file_made": not existed})
+    return "added to the left section"
 
 def bar_remove():
+    """Undo exactly what bar_install did. If it added us where nothing was, take us out
+    rather than inventing a widget the user never had."""
     s = read_json(SHELL_JSON, {})
-    left = s.get("bar", {}).get("layout", {}).get("left", [])
-    ids = [w.get("id") if isinstance(w, dict) else w for w in left]
-    if PLUGIN_ID not in ids: return False
-    left[ids.index(PLUGIN_ID)] = {"id": "omarchy.workspaces"}
-    write_json(SHELL_JSON, s)
-    return True
+    was = recorded("bar")
+    for name, items in sections(s):
+        for i, w in enumerate(items):
+            if widget_id(w) != PLUGIN_ID: continue
+            if was and was.get("replaced") is not None: items[i] = was["replaced"]
+            else: items.pop(i)
+            prune_empty(s, (was or {}).get("made", []))
+            if (was or {}).get("file_made") and not s: remove_file(SHELL_JSON)
+            else: write_json(SHELL_JSON, s)
+            return "put Omarchy's strip back" if was and was.get("replaced") else "removed"
+    return "was not placed"
 
 def bin_install(src):
+    """Never overwrite somebody else's agent-ws without keeping a copy of it."""
     os.makedirs(os.path.dirname(BIN), exist_ok=True)
     want = open(f"{src}/bin/agent-ws").read()
-    if os.path.exists(BIN) and open(BIN).read() == want: return False
+    note = ""
+    if os.path.exists(BIN):
+        have = open(BIN).read()
+        if have == want: return "already current"
+        if not recorded("bin"):
+            shutil.copyfile(BIN, BIN + ".before-agent-workspaces")
+            note = f" (kept your existing one at {BIN}.before-agent-workspaces)"
     shutil.copyfile(f"{src}/bin/agent-ws", BIN)
     os.chmod(BIN, 0o755)
-    return True
+    record(bin=True)
+    return "installed" + note
+
+def bin_remove():
+    if not os.path.exists(BIN): return "not installed"
+    os.remove(BIN)
+    back = BIN + ".before-agent-workspaces"
+    if os.path.exists(back):
+        os.replace(back, BIN); os.chmod(BIN, 0o755)
+        return "removed, and your earlier one put back"
+    return "removed"
 
 def restart_shell():
     if os.environ.get("AGENT_WS_NO_RELOAD"): return   # set by the test harness
@@ -163,11 +256,16 @@ def reload_hypr():
 # ---------- commands ----------
 def install(src):
     print("Agent Workspaces")
-    say("agent-ws ->", BIN, "…", "installed" if bin_install(src) else "already current")
-    n = hooks_install();  say("Claude Code hooks …", f"added {n}" if n else "already there")
-    say("keybindings …", "added" if block(BINDINGS, BINDINGS_BLOCK) else "already there")
-    say("login autostart …", "added" if block(AUTOSTART, AUTOSTART_BLOCK) else "already there")
-    say("bar widget …", "placed" if bar_install() else "already placed")
+    say("agent-ws ->", BIN, "…", step(bin_install, src))
+    say("Claude Code hooks …", step(hooks_install))
+    say("keybindings …", step(block, BINDINGS, BINDINGS_BLOCK))
+    say("login autostart …", step(block, AUTOSTART, AUTOSTART_BLOCK))
+    say("bar widget …", step(bar_install))
+    print()
+    say("Super+Shift+A now opens Claude — it replaces Omarchy's default binding for ChatGPT.")
+    say("It runs plain `claude`. To pass your own flags, or start somewhere other than the")
+    say("home directory, write ~/.config/omarchy/agent-workspaces.json:")
+    say('  {"launch": ["claude", "--dangerously-skip-permissions"], "cwd": "~/code"}')
     if os.path.expanduser("~/.local/bin") not in os.environ.get("PATH", "").split(":"):
         say("note: ~/.local/bin is not on your PATH; the keybindings will not find agent-ws")
     reload_hypr(); restart_shell()
@@ -175,12 +273,14 @@ def install(src):
 
 def uninstall(src):
     print("Removing Agent Workspaces")
-    say("bar widget …", "restored to Omarchy's" if bar_remove() else "was not placed")
-    n = hooks_remove(); say("Claude Code hooks …", f"removed {n}" if n else "none found")
-    say("keybindings …", "removed" if unblock(BINDINGS) else "none found")
-    say("login autostart …", "removed" if unblock(AUTOSTART) else "none found")
-    if os.path.exists(BIN): os.remove(BIN); say("agent-ws …", "removed")
-    else: say("agent-ws …", "not installed")
+    say("bar widget …", step(bar_remove))
+    say("Claude Code hooks …", step(hooks_remove))
+    say("keybindings …", step(unblock, BINDINGS))
+    say("login autostart …", step(unblock, AUTOSTART))
+    say("agent-ws …", step(bin_remove))
+    # our own bookkeeping goes; the session state stays, it is the user's
+    try: os.remove(RECORD)
+    except OSError: pass
     say("state kept at ~/.local/state/omarchy/agent-workspaces (delete it yourself if you want)")
     reload_hypr(); restart_shell()
     print("\nDone. `omarchy plugin remove agentws.workspaces` takes the widget files too.")

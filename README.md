@@ -39,6 +39,12 @@ cached so a title costs one call ever.
 - `Build story engine compose.py with beat vocabulary` → `compose-beats`
 - `Skip permissions dangerously` → `perms-danger`
 
+The better name costs one `claude -p` call per distinct title. **The window title is sent to
+the Anthropic API** — nothing else: not the transcript, not your working directory, not the
+session id. Claude renames a chat as it goes, so a long session may cost a few calls over its
+life, one per new title. Set `AGENT_WS_NO_AI=1` to turn this off and keep the plain derived
+names, which need no network at all.
+
 Close the session and the name goes with it — unless you gave the workspace a name yourself,
 in which case it stays, and so does the workspace's memory of what ran in it.
 
@@ -48,8 +54,18 @@ in which case it stays, and so does the workspace's memory of what ran in it.
 |---|---|
 | `Super + R` | Name this workspace. Enter accepts the suggestion. |
 | `Super + Shift + R` | Forget the name. Sessions and windows stay. |
-| `Super + Shift + A` | Bring back the sessions this workspace remembers. Press again once they are open and you get a fresh one alongside them. |
-| `Super + Shift + Alt + R` | Reset: forget the name, forget what it remembered, close its Claude windows. Asks first. |
+| `Super + Shift + A` | Bring back the sessions this workspace remembers. Press again once they are open and you get a fresh one alongside them. **This replaces Omarchy's default binding, which opens ChatGPT.** |
+| `Super + Shift + Alt + R` | Reset: forget the name, forget what it remembered, close its Claude windows. Asks first whenever anything would be lost — including when the windows are already closed but the workspace still remembers them. |
+
+`Super + Shift + A` runs plain `claude`. To give it your own flags, or start it somewhere
+other than your home directory, write `~/.config/omarchy/agent-workspaces.json`:
+
+```json
+{ "launch": ["claude", "--dangerously-skip-permissions"], "cwd": "~/code" }
+```
+
+It only ever closes a window it can tie to a session it started. A window it does not
+recognise is left alone, even if it is sitting in the workspace you are resetting.
 
 ## Pinned workspaces
 
@@ -94,28 +110,46 @@ To remove it:
 omarchy plugin remove agentws.workspaces
 ```
 
-Uninstall takes back exactly what install added — your other hooks, your other keybindings
-and the rest of your `shell.json` are untouched. It leaves your state directory alone; delete
+Uninstall takes back what install added and only that. It matches its own hook entries
+exactly, so a hook of your own that also calls `agent-ws` survives. It writes Omarchy's
+workspace strip back into the exact slot it took, in whichever bar section that was — and if
+install had nothing to replace, uninstall removes our widget rather than inventing one. Files
+install created on a bare machine are deleted again rather than left as empty husks. If one
+of your config files has a syntax error, uninstall says so and carries on with the rest
+instead of stopping half-done.
+
+`shell.json` and `settings.json` come back with the same content but reformatted at two-space
+indent, which is Omarchy's own style. Your state directory is left alone; delete
 `~/.local/state/omarchy/agent-workspaces` yourself if you want it gone.
+
+`test/sandbox-install.sh` and `test/edge-cases.sh` prove all of this against a throwaway home
+directory. Run them.
 
 ## How it works
 
 Nothing here patches Omarchy. The widget is a normal shell plugin in `~/.config/omarchy/`,
 loaded after the packaged defaults, so an `omarchy update` cannot break it.
 
-`agent-ws` is one small Python program that owns every fact the bar needs, in three JSON
-files under `~/.local/state/omarchy/agent-workspaces/`. Claude Code hooks feed it: session
-start and end, notifications, prompts, tool calls. The bar reads those files and watches
-Hyprland; it never asks Claude anything.
+Install does edit three files you own — `~/.claude/settings.json`, `~/.config/hypr/bindings.lua`
+and `~/.config/hypr/autostart.lua` — plus your `shell.json`. Everything it adds is marked, and
+uninstall takes back exactly those marks.
+
+`agent-ws` is one small Python program that owns every fact the bar needs, in JSON files under
+`~/.local/state/omarchy/agent-workspaces/` (sessions, needs, name cache, plus lock files and a
+small debug log). Claude Code hooks feed it: session start and end, notifications, prompts,
+tool calls. The bar reads those files and watches Hyprland; it never asks Claude anything.
 
 The "working" and "idle" marks do not come from a hook at all. Claude already writes a status
-glyph into its terminal title, so the bar reads the titles Hyprland is holding anyway. That
-is why the state is instant and costs nothing.
+glyph into its terminal title, so the bar reads the titles Hyprland is holding anyway. That is
+why the state is instant and costs nothing. The flip side: any window whose title happens to
+start with `◐ ◑ ◒ ◓ ✳` is *shown* as a session. It will not be closed by a reset — that needs
+a real session record — but it will occupy a slot until you retitle it.
 
 ## Requirements
 
 Omarchy with the Quickshell bar, Hyprland, Python 3, and Claude Code. `~/.local/bin` on your
-PATH.
+PATH. `omarchy-launch-tui` and `omarchy menu` come with Omarchy and are used for opening
+sessions and for the reset confirmation.
 
 ## Licence
 

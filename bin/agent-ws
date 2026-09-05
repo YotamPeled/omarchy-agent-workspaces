@@ -358,6 +358,17 @@ def cmd_name(sub, given=""):
     elif sub == "list":
         print(json.dumps(config(), indent=2))
 
+SETTINGS = f"{HOME}/.config/omarchy/agent-workspaces.json"
+
+def launch_command():
+    """What Super+Shift+A runs. Plain `claude` unless you say otherwise in
+    ~/.config/omarchy/agent-workspaces.json, e.g.
+        {"launch": ["claude", "--dangerously-skip-permissions"], "cwd": "~/code"}"""
+    cfg = load(SETTINGS, {})
+    cmd = cfg.get("launch") or ["claude"]
+    if not isinstance(cmd, list) or not all(isinstance(c, str) for c in cmd): cmd = ["claude"]
+    return cmd, os.path.expanduser(str(cfg.get("cwd") or ""))
+
 # Session-scoped vars Claude Code exports to its children. Inheriting them makes the
 # new window a *child* session, which never writes a transcript and so can never be
 # resumed. Strip them so a session launched from inside Claude is a real one.
@@ -368,16 +379,34 @@ CHILD_ENV = ("CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE
 
 def launch_claude(cwd, *args):
     env = {k: v for k, v in os.environ.items() if k not in CHILD_ENV}
-    subprocess.Popen(["omarchy-launch-tui", "--app-id=org.omarchy.agent", "claude-yolo", *args],
+    cmd, home_cwd = launch_command()
+    cwd = cwd if os.path.isdir(cwd) else home_cwd
+    subprocess.Popen(["omarchy-launch-tui", "--app-id=org.omarchy.agent", *cmd, *args],
                      cwd=cwd if os.path.isdir(cwd) else None, start_new_session=True, env=env,
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
+def workspace_belongings(ws):
+    """What a reset of `ws` would take: its name, the session records that belong to it, and
+    the windows to close. A window is only ours if a session record points at it — a glyph in
+    a title is enough to *show* a session, but not enough to close somebody's window."""
+    live = {norm_addr(c["address"]): c for c in (hypr("clients") or [])}
+    here, elsewhere = {}, set()
+    for sid, r in sessions().items():
+        a = norm_addr(r.get("address", ""))
+        win = live.get(a)
+        if win is not None and win["workspace"]["id"] == ws: here[sid] = win
+        elif win is not None: elsewhere.add(sid)
+    # Closed records that started here and have no window anywhere are this workspace's too.
+    forget = set(here) | {sid for sid, r in sessions().items()
+                          if sid not in here and sid not in elsewhere and r.get("workspace") == ws}
+    return ws_name(ws), forget, list(here.values())
+
 def reset_workspace(ws):
-    """Bare number again: no name, no remembered sessions, no marks, no windows.
+    """Bare number again: no name, no remembered sessions, no marks, no windows of ours.
     A pin keeps its icon — that is configuration, not session state."""
-    wins = session_windows(ws)
+    _, forget, wins = workspace_belongings(ws)
     if set_name(ws, "") is False: return None
-    update(SESSIONS, lambda s: {k: v for k, v in s.items() if v.get("workspace") != ws})
+    update(SESSIONS, lambda s: {k: v for k, v in s.items() if k not in forget})
     gone = {norm_addr(w["address"]) for w in wins}
     needs_write(lambda n: {k: v for k, v in n.items() if norm_addr(k) not in gone})
     dispatch(f'hl.dsp.workspace.rename({{ workspace = {ws}, name = "{ws}" }})')
@@ -387,16 +416,36 @@ def reset_workspace(ws):
 
 def cmd_reset(args):
     every = "--all" in args
-    targets = ([w["id"] for w in (hypr("workspaces") or []) if w["id"] > 0]
-               if every else [focused_ws()])
-    targets = sorted(set(targets))
+    if every:
+        # Pinned workspaces are configuration, not session state; --all leaves them alone.
+        targets = sorted({w["id"] for w in (hypr("workspaces") or []) if w["id"] > 0}
+                         - {int(k) for k in config() if k.isdigit() and entry(k) and entry(k).get("icon")})
+    else:
+        targets = [focused_ws()]
     if not targets: return
-    n = sum(len(session_windows(w)) for w in targets)
-    if n and "--force" not in args:
+    names, forget, wins = set(), set(), 0
+    for w in targets:
+        n, f, ws_wins = workspace_belongings(w)
+        if n: names.add(n)
+        forget |= f; wins += len(ws_wins)
+    if not (names or forget or wins):
+        notify("Nothing to reset", f"workspace {targets[0]}" if not every else "")
+        return
+    # Ask whenever anything would be lost, not only when a window would close: a workspace
+    # whose sessions are all closed is exactly the one whose memory is worth keeping.
+    if "--force" not in args:
+        lost = []
+        if names: lost.append("the name" if len(names) == 1 else f"{len(names)} names")
+        if forget: lost.append(f"{len(forget)} remembered session" + ("s" if len(forget) != 1 else ""))
+        if wins: lost.append(f"{wins} open window" + ("s" if wins != 1 else ""))
         what = "every workspace" if every else f"workspace {targets[0]}"
-        r = subprocess.run(["omarchy", "menu", "select",
-                            f"Reset {what}? {n} Claude window(s) will close", "Cancel", "Reset"],
-                           capture_output=True, text=True)
+        try:
+            r = subprocess.run(["omarchy", "menu", "select",
+                                f"Reset {what}? This loses " + ", ".join(lost), "Cancel", "Reset"],
+                               capture_output=True, text=True)
+        except OSError:
+            notify("Reset cancelled", "the omarchy menu is not available")
+            return
         if r.returncode != 0 or r.stdout.strip() != "Reset": return
     for w in targets: reset_workspace(w)
     notify("Workspace reset", "every workspace" if every else f"workspace {targets[0]}")
