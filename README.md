@@ -5,13 +5,9 @@ running. Omarchy's workspace strip becomes the thing that tells you what every C
 session is doing — because the workspaces are already there, already on screen, and already
 one keystroke apart.
 
-```
-               ▁▁▁▁▁▁▁▁▁▁▁▁▁▁
-1 api-retry    2 checkout-bug    3 pdf-export    4 rag-eval    5    6
-·              ●                 ▂▂              ·
-```
+![The workspace strip: four named sessions, one working, one waiting on you](preview.png)
 
-Four pieces of work, one glance: the checkout bug is running, the PDF export is waiting on
+Four pieces of work, one glance: the PDF export is running, the checkout bug is waiting on
 you, the API retry and the RAG eval are idle. A workspace with nothing in it stays a plain,
 dim number.
 
