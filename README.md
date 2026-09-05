@@ -52,11 +52,27 @@ in which case it stays, and so does the workspace's memory of what ran in it.
 |---|---|
 | `Super + R` | Name this workspace. Enter accepts the suggestion. |
 | `Super + Shift + R` | Forget the name. Sessions and windows stay. |
-| `Super + Shift + A` | Bring back the sessions this workspace remembers. Press again once they are open and you get a fresh one alongside them. **This replaces Omarchy's default binding, which opens ChatGPT.** |
 | `Super + Shift + Alt + R` | Reset: forget the name, forget what it remembered, close its Claude windows. Asks first whenever anything would be lost — including when the windows are already closed but the workspace still remembers them. |
 
-`Super + Shift + A` runs plain `claude`. To give it your own flags, or start it somewhere
-other than your home directory, write `~/.config/omarchy/agent-workspaces.json`:
+Those three keys are free in a stock Omarchy; install adds them and nothing else. **It never
+rebinds a key you already have.**
+
+## Opening sessions
+
+`agent-ws launch` opens Claude in the workspace you are on, or brings back the sessions a
+named workspace remembers — press it again once they are open and you get a fresh one
+alongside them. It is deliberately not bound to anything: pick your own key.
+
+```lua
+-- ~/.config/hypr/bindings.lua
+o.bind("SUPER + SHIFT + A", "Agent", "agent-ws launch")
+```
+
+That particular key is Omarchy's ChatGPT shortcut, and Omarchy's defaults load first, so add
+`hl.unbind("SUPER + SHIFT + A")` above the line if you want to take it over.
+
+It runs plain `claude`. To give it your own flags, or start it somewhere other than your home
+directory, write `~/.config/omarchy/agent-workspaces.json`:
 
 ```json
 { "launch": ["claude", "--dangerously-skip-permissions"], "cwd": "~/code" }

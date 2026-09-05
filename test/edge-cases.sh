@@ -81,12 +81,14 @@ run install >/dev/null; run uninstall >/dev/null
 check "theirs is put back" "$(cat "$S/.local/bin/agent-ws")" "#!/bin/sh"
 rm -rf "$S"
 
-echo "the keybinding block releases Omarchy's own Super+Shift+A"
+echo "it binds only its own keys and never rebinds one of Omarchy's"
 newhome; run install >/dev/null
-check "unbinds ChatGPT before binding Claude" \
-  "$(grep -c 'hl.unbind("SUPER + SHIFT + A")' "$S/.config/hypr/bindings.lua")" "1"
-check "and the unbind comes first" \
-  "$(awk '/hl.unbind\("SUPER \+ SHIFT \+ A"\)/{u=NR} /o.bind\("SUPER \+ SHIFT \+ A"/{b=NR} END{print (u<b)?"yes":"no"}' "$S/.config/hypr/bindings.lua")" "yes"
+check "adds no binding for Super+Shift+A" \
+  "$(grep -c 'SHIFT + A"' "$S/.config/hypr/bindings.lua")" "0"
+check "unbinds nothing at all" \
+  "$(grep -c 'hl.unbind' "$S/.config/hypr/bindings.lua")" "0"
+check "binds exactly its own three keys" \
+  "$(grep -c '^o.bind(' "$S/.config/hypr/bindings.lua")" "3"
 rm -rf "$S"
 
 echo
