@@ -32,7 +32,7 @@ check "takes over the strip in place, no second one" \
   "$(python3 -c "
 import json;d=json.load(open('$S/.config/omarchy/shell.json'))['bar']['layout']
 print([w['id'] for w in d['center']], len(d['left']))")" \
-  "['agentws.workspaces', 'omarchy.clock'] 1"
+  "['io.github.yotampeled.agent-workspaces', 'omarchy.clock'] 1"
 run uninstall >/dev/null
 check "puts it back exactly where it was" "$(j "$S/.config/omarchy/shell.json")" "$before"
 rm -rf "$S"

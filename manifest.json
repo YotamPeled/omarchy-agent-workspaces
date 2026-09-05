@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "id": "agentws.workspaces",
+  "id": "io.github.yotampeled.agent-workspaces",
   "name": "Agent Workspaces",
   "version": "1.1.0",
   "author": "Yotam Peled",

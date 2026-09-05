@@ -11,7 +11,7 @@ nothing else. Run it as many times as you like: the second run is a no-op.
 import json, os, re, shutil, subprocess, sys
 
 HOME = os.path.expanduser("~")
-PLUGIN_ID = "agentws.workspaces"
+PLUGIN_ID = "io.github.yotampeled.agent-workspaces"
 BIN = f"{HOME}/.local/bin/agent-ws"
 SETTINGS = f"{HOME}/.claude/settings.json"
 SHELL_JSON = f"{HOME}/.config/omarchy/shell.json"
@@ -283,7 +283,7 @@ def uninstall(src):
     except OSError: pass
     say("state kept at ~/.local/state/omarchy/agent-workspaces (delete it yourself if you want)")
     reload_hypr(); restart_shell()
-    print("\nDone. `omarchy plugin remove agentws.workspaces` takes the widget files too.")
+    print("\nDone. `omarchy plugin remove io.github.yotampeled.agent-workspaces` takes the widget files too.")
 
 if __name__ == "__main__":
     if len(sys.argv) < 3: sys.exit(__doc__)

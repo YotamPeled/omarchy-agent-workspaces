@@ -76,7 +76,7 @@ recognise is left alone, even if it is sitting in the workspace you are resettin
 
 ```bash
 omarchy plugin add https://github.com/YotamPeled/omarchy-agent-workspaces.git
-~/.config/omarchy/plugins/agentws.workspaces/install
+~/.config/omarchy/plugins/io.github.yotampeled.agent-workspaces/install
 ```
 
 The first command installs the bar widget. The second puts `agent-ws` on your PATH, adds the
@@ -87,8 +87,8 @@ twice is safe.
 To remove it:
 
 ```bash
-~/.config/omarchy/plugins/agentws.workspaces/uninstall
-omarchy plugin remove agentws.workspaces
+~/.config/omarchy/plugins/io.github.yotampeled.agent-workspaces/uninstall
+omarchy plugin remove io.github.yotampeled.agent-workspaces
 ```
 
 Uninstall takes back what install added and only that. It matches its own hook entries
