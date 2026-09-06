@@ -189,22 +189,18 @@ def hooks_install_one(cfg):
     if not isinstance(doc, dict): raise Bad(path)
     hooks = doc.setdefault("hooks", {})
     if not isinstance(hooks, dict): raise Bad(path)
-    # What the release before three-agent support recorded, for Claude only: those events
-    # are ours to rewrite, and nothing else is.
-    legacy = set(recorded("hooks", [])) if cfg["name"] == "claude" else set()
-    legacy |= set(recorded(f"hooks_{cfg['name']}", []))
     added = []
     for event, sub in cfg["events"].items():
         entries = hooks.setdefault(event, [])
         if not isinstance(entries, list): raise Bad(path)
         want = our_entry(sub, cfg["name"], cfg["matcher"])
         if want in entries: continue
-        # An entry we wrote in an older shape is upgraded in place, not skipped: leaving it
-        # would keep a line that does not name its own agent, which is the whole point of
-        # the new one. Only an event the earlier release recorded as ours is replaced — an
-        # identical line the user wrote themselves is theirs and is left exactly alone.
-        old = [e for e in entries if e in ours(sub, cfg["name"], cfg["matcher"])] if event in legacy else []
-        if not old and any(e in ours(sub, cfg["name"], cfg["matcher"]) for e in entries): continue
+        # An entry byte-identical to one an older version of this installer wrote is
+        # upgraded in place rather than left, because leaving it keeps a line that does not
+        # name its own agent — the one thing this version is for. That is still only what
+        # we added: a hook of the user's own means one with their arguments, their timeout
+        # or their own wrapper, and every one of those is untouched.
+        old = [e for e in entries if e in ours(sub, cfg["name"], cfg["matcher"])]
         for e in old: entries.remove(e)
         entries.append(want)
         added.append(event)
