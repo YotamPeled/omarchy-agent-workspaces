@@ -4,6 +4,7 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 S="$(mktemp -d)"; trap 'rm -rf "$S"' EXIT
+unset XDG_CONFIG_HOME XDG_STATE_HOME XDG_DATA_HOME
 mkdir -p "$S/.claude" "$S/.config/omarchy" "$S/.config/hypr" "$S/.local/bin"
 cat > "$S/.claude/settings.json" <<'J'
 { "model": "opus", "hooks": { "SessionStart": [ { "matcher": "*", "hooks": [ { "type": "command", "command": "bash /somewhere/their-own.sh", "timeout": 10 } ] } ] } }

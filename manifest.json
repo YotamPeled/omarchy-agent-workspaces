@@ -2,14 +2,14 @@
   "schemaVersion": 1,
   "id": "io.github.yotampeled.agent-workspaces",
   "name": "Agent Workspaces",
-  "version": "1.1.0",
+  "version": "2.0.0",
   "author": "Yotam Peled",
-  "description": "Workspace strip that shows what each Claude Code session is doing",
+  "description": "Workspace strip that shows what each Claude Code, Codex and Muse Code session is doing",
   "kinds": ["bar-widget"],
   "entryPoints": { "barWidget": "Workspaces.qml" },
   "barWidget": {
     "displayName": "Agent Workspaces",
-    "description": "Each workspace shows the name of the Claude Code session in it and whether it is working, idle, or waiting on you",
+    "description": "Each workspace shows which agent is in it — Claude Code, Codex or Muse Code — its session name, and whether it is working, idle, or waiting on you",
     "category": "Compositor",
     "defaultSection": "left",
     "allowMultiple": false

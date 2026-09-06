@@ -1,9 +1,9 @@
 # Agent Workspaces
 
 **Your OS is the harness.** No tmux, no session manager, no second window listing what is
-running. Omarchy's workspace strip becomes the thing that tells you what every Claude Code
-session is doing — because the workspaces are already there, already on screen, and already
-one keystroke apart.
+running. Omarchy's workspace strip becomes the thing that tells you what every coding-agent
+session is doing — Claude Code, Codex and Muse Code — because the workspaces are already
+there, already on screen, and already one keystroke apart.
 
 ![The workspace strip: four named sessions, one working, one waiting on you](preview.png)
 
@@ -19,6 +19,7 @@ dim number.
 | A dim dot | the session is idle, waiting for you to type |
 | A rule under the number | the session needs you: a permission prompt, an elicitation |
 | A rule above the number and name | this is the workspace you are on |
+| A small `C`, `X` or `M` | which agent is in the slot: Claude Code, Codex, Muse Code |
 
 Several sessions can share a workspace. The slot shows the focused one's name and the worst
 state of the group, so a workspace never looks calm while something in it is stuck. Hover it
@@ -27,9 +28,37 @@ to see them all.
 Every mark takes its colour from your active Omarchy theme. Change the theme and the strip
 changes with it.
 
+## Three agents
+
+Claude Code, Codex and Muse Code all show up the same way. Install wires whichever of them is
+actually on your machine and skips the rest.
+
+Each agent is asked to name itself: the hook line install writes into that agent's own config
+says which agent it belongs to, so the strip is told rather than guessing. An earlier version
+guessed from the process tree, and three review rounds broke the guess three different ways —
+a program whose name merely started the same, one agent launched inside another's window, and
+one event name shared by two agents. The guess survives only as a fallback for a hook you
+wired by hand, and when it cannot tell, the slot stays empty rather than showing the wrong
+thing.
+
+Two of the three need a word about how they are wired:
+
+- **Codex** will not run a hook nobody has approved. The first time you start it after
+  installing, it says hooks are new or changed and offers to review them, trust them all, or
+  continue without trusting. Choose to trust them once and Codex joins the strip. We do not
+  write that approval for you: it is Codex asking you, not us.
+- **Muse Code** reads a hook file only from the folder you are working in, so there is no one
+  file that would cover every project. Install therefore adds a small Muse plugin instead,
+  through Muse's own `muse plugins install --scope user`, and approves it in the same step.
+  Uninstall removes it.
+
+Working and idle are free where an agent already says so in its terminal title — Claude and
+Muse both do, with different marks — and come from the hooks otherwise, which is the only
+thing that makes a Codex window visible at all.
+
 ## Names
 
-A session names its own workspace. The name comes from the title Claude gives the chat:
+A session names its own workspace. The name comes from the title the agent gives the chat:
 first a name derived on the spot, then a better one from Haiku about seven seconds later,
 cached so a title costs one call ever.
 
@@ -37,11 +66,12 @@ cached so a title costs one call ever.
 - `Build story engine compose.py with beat vocabulary` → `compose-beats`
 - `Skip permissions dangerously` → `perms-danger`
 
-The better name costs one `claude -p` call per distinct title. **The window title is sent to
-the Anthropic API** — nothing else: not the transcript, not your working directory, not the
-session id. Claude renames a chat as it goes, so a long session may cost a few calls over its
-life, one per new title. Set `AGENT_WS_NO_AI=1` to turn this off and keep the plain derived
-names, which need no network at all.
+The better name costs one `claude -p` call per distinct title, whichever agent the session
+belongs to. **The window title is sent to the Anthropic API** — nothing else: not the
+transcript, not your working directory, not the session id. An agent renames a chat as it
+goes, so a long session may cost a few calls over its life, one per new title. Set
+`AGENT_WS_NO_AI=1` to turn this off and keep the plain derived names, which need no network
+at all.
 
 Close the session and the name goes with it — unless you gave the workspace a name yourself,
 in which case it stays, and so does the workspace's memory of what ran in it.
@@ -52,16 +82,17 @@ in which case it stays, and so does the workspace's memory of what ran in it.
 |---|---|
 | `Super + R` | Name this workspace. Enter accepts the suggestion. |
 | `Super + Shift + R` | Forget the name. Sessions and windows stay. |
-| `Super + Shift + Alt + R` | Reset: forget the name, forget what it remembered, close its Claude windows. Asks first whenever anything would be lost — including when the windows are already closed but the workspace still remembers them. |
+| `Super + Shift + Alt + R` | Reset: forget the name, forget what it remembered, close its agent windows. Asks first whenever anything would be lost — including when the windows are already closed but the workspace still remembers them. |
 
 Those three keys are free in a stock Omarchy; install adds them and nothing else. **It never
 rebinds a key you already have.**
 
 ## Opening sessions
 
-`agent-ws launch` opens Claude in the workspace you are on, or brings back the sessions a
-named workspace remembers — press it again once they are open and you get a fresh one
-alongside them. It is deliberately not bound to anything: pick your own key.
+`agent-ws launch` opens an agent in the workspace you are on, or brings back the sessions a
+named workspace remembers — each one reopened with its own agent, told to resume the session
+it was, so a Codex session is never reopened as Claude. Press it again once they are open and
+you get a fresh one alongside them. It is deliberately not bound to anything: pick your own key.
 
 ```lua
 -- ~/.config/hypr/bindings.lua
@@ -71,8 +102,8 @@ o.bind("SUPER + SHIFT + A", "Agent", "agent-ws launch")
 That particular key is Omarchy's ChatGPT shortcut, and Omarchy's defaults load first, so add
 `hl.unbind("SUPER + SHIFT + A")` above the line if you want to take it over.
 
-It runs plain `claude`. To give it your own flags, or start it somewhere other than your home
-directory, write `~/.config/omarchy/agent-workspaces.json`:
+A fresh one runs plain `claude`. To give it your own flags, or start it somewhere other than
+your home directory, write `~/.config/omarchy/agent-workspaces.json`:
 
 ```json
 { "launch": ["claude", "--dangerously-skip-permissions"], "cwd": "~/code" }
@@ -96,9 +127,9 @@ omarchy plugin add https://github.com/YotamPeled/omarchy-agent-workspaces.git
 ```
 
 The first command installs the bar widget. The second puts `agent-ws` on your PATH, adds the
-five Claude Code hooks to `~/.claude/settings.json`, adds the keybindings, and swaps our
-widget in for Omarchy's workspace strip. It only ever adds what is missing, so running it
-twice is safe.
+hooks to each installed agent's own config, adds the keybindings, and swaps our widget in for
+Omarchy's workspace strip. It only ever adds what is missing, so running it twice is safe, and
+it tells you which agents it found and which it skipped.
 
 To remove it:
 
@@ -120,31 +151,38 @@ indent, which is Omarchy's own style. Your state directory is left alone; delete
 `~/.local/state/omarchy/agent-workspaces` yourself if you want it gone.
 
 `test/sandbox-install.sh` and `test/edge-cases.sh` prove all of this against a throwaway home
-directory. Run them.
+directory, across all three agents and across machines where only some are installed.
+`test/strip-logic.sh` drives the widget's own decisions with made-up windows and records. Run
+them.
 
 ## How it works
 
 Nothing here patches Omarchy. The widget is a normal shell plugin in `~/.config/omarchy/`,
 loaded after the packaged defaults, so an `omarchy update` cannot break it.
 
-Install does edit three files you own — `~/.claude/settings.json`, `~/.config/hypr/bindings.lua`
-and `~/.config/hypr/autostart.lua` — plus your `shell.json`. Everything it adds is marked, and
-uninstall takes back exactly those marks.
+Install does edit files you own — `~/.claude/settings.json`, `~/.codex/hooks.json`,
+`~/.config/hypr/bindings.lua` and `~/.config/hypr/autostart.lua`, plus your `shell.json` — and
+installs one Muse plugin. Everything it adds is marked, and uninstall takes back exactly what
+it added and nothing else, including a hook of your own that happens to be written the same
+way ours is.
 
 `agent-ws` is one small Python program that owns every fact the bar needs, in JSON files under
 `~/.local/state/omarchy/agent-workspaces/` (sessions, needs, name cache, plus lock files and a
-small debug log). Claude Code hooks feed it: session start and end, notifications, prompts,
-tool calls. The bar reads those files and watches Hyprland; it never asks Claude anything.
+small debug log). Each agent's hooks feed it: session start and end, permission prompts,
+prompts submitted, tool calls, and the end of a turn. The bar reads those files and watches
+Hyprland; it never asks any agent anything.
 
-The "working" and "idle" marks do not come from a hook at all. Claude already writes a status
-glyph into its terminal title, so the bar reads the titles Hyprland is holding anyway. That is
-why the state is instant and costs nothing. The flip side: any window whose title happens to
-start with `◐ ◑ ◒ ◓ ✳` is *shown* as a session. It will not be closed by a reset — that needs
-a real session record — but it will occupy a slot until you retitle it.
+Where an agent writes a status mark into its terminal title, the bar reads that instead,
+because the titles are ones Hyprland is holding anyway — which is why Claude's state is
+instant and costs nothing, and why Muse's working mark is too. The flip side: any window whose
+title happens to start with one of those marks is *shown* as a session. It will not be closed
+by a reset — that needs a real session record — but it will occupy a slot until you retitle it.
+Codex marks nothing, so a Codex slot exists only because of the record its hooks wrote.
 
 ## Requirements
 
-Omarchy with the Quickshell bar, Hyprland, Python 3, and Claude Code. `~/.local/bin` on your
+Omarchy with the Quickshell bar, Hyprland, Python 3, and at least one of Claude Code, Codex
+and Muse Code. `~/.local/bin` on your
 PATH. `omarchy-launch-tui` and `omarchy menu` come with Omarchy and are used for opening
 sessions and for the reset confirmation.
 

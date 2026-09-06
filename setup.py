@@ -8,7 +8,7 @@ nothing else. Run it as many times as you like: the second run is a no-op.
             autostart; and the bar widget in place of Omarchy's workspace strip.
   uninstall all of the above.
 """
-import json, os, re, shutil, subprocess, sys
+import contextlib, json, os, re, shutil, subprocess, sys
 
 HOME = os.path.expanduser("~")
 PLUGIN_ID = "io.github.yotampeled.agent-workspaces"
@@ -19,15 +19,45 @@ BINDINGS = f"{HOME}/.config/hypr/bindings.lua"
 AUTOSTART = f"{HOME}/.config/hypr/autostart.lua"
 BEGIN, END = "-- >>> agent-workspaces", "-- <<< agent-workspaces"
 NOTE = "-- Managed by Agent Workspaces. Edits inside this block are lost on reinstall."
-STATE = f"{HOME}/.local/state/omarchy/agent-workspaces"
+def state_home():
+    """XDG_STATE_HOME is honoured only when it sits inside HOME, for the same reason the
+    config folder is: a sandbox that redirects HOME alone must not reach the real machine."""
+    x = os.environ.get("XDG_STATE_HOME", "")
+    inside = x and os.path.commonpath([os.path.abspath(x), HOME]) == HOME
+    return os.path.abspath(x) if inside else f"{HOME}/.local/state"
+
+STATE = state_home() + "/omarchy/agent-workspaces"
+DEFAULT_STATE = f"{HOME}/.local/state/omarchy/agent-workspaces"
 RECORD = f"{STATE}/install.json"          # what we changed, so uninstall can undo just that
 HOOK_TIMEOUT = 10
 
-HOOKS = {                                    # Claude Code event -> agent-ws subcommand
+# One row per agent we can wire up. `events` maps that agent's own event name to the
+# agent-ws subcommand it should call — the names are each agent's, not a shared set:
+# Codex and Muse ask for the user with PermissionRequest and have no Notification at all,
+# and Claude is the only one of the three with a Notification event. Every line names its
+# own agent with --agent, so nothing has to be guessed from the process tree.
+#   bin      what must be on PATH for this agent to count as installed
+#   path     the file we write, which is that agent's own hook configuration
+# In all three the hooks live under a top-level "hooks" key, so one writer serves them
+# all; for Claude that key sits inside a larger settings file, which is why uninstall only
+# deletes a file it made itself and finds empty again.
+CLAUDE_EVENTS = {
     "SessionStart": "session-start", "SessionEnd": "session-end",
     "Notification": "notification", "UserPromptSubmit": "prompt-submit",
-    "PreToolUse": "pre-tool",
+    "PreToolUse": "pre-tool", "Stop": "stop",
 }
+OTHER_EVENTS = {
+    "SessionStart": "session-start", "SessionEnd": "session-end",
+    "PermissionRequest": "notification", "UserPromptSubmit": "prompt-submit",
+    "PreToolUse": "pre-tool", "Stop": "stop",
+}
+AGENT_CONFIGS = (
+    {"name": "claude", "bin": "claude", "path": SETTINGS, "matcher": True,
+     "events": CLAUDE_EVENTS, "label": "Claude Code"},
+    {"name": "codex", "bin": "codex", "path": f"{HOME}/.codex/hooks.json", "matcher": False,
+     "events": OTHER_EVENTS, "label": "Codex",
+     "after": "Codex asks once, on its next start, whether to trust the new hook"},
+)
 
 BINDINGS_BLOCK = f"""{BEGIN}
 {NOTE}
@@ -114,48 +144,140 @@ def unblock(path):
 
 
 # ---------- the pieces ----------
-def our_entry(sub):
-    return {"matcher": "*",
-            "hooks": [{"type": "command", "command": f"agent-ws hook {sub}",
-                       "timeout": HOOK_TIMEOUT}]}
+def state_flag():
+    """Only written when this machine's state folder is not the one the reporter assumes.
+    Muse drops that setting from a hook's environment, so the line is the only place that
+    can carry it."""
+    return [] if STATE == DEFAULT_STATE else ["--state", STATE]
 
-def hooks_install():
-    """Add our five hooks. Anything already in settings.json is left exactly as it is —
-    including a hook of the user's own that happens to call agent-ws."""
-    existed = os.path.exists(SETTINGS) and open(SETTINGS).read().strip()
-    s = read_json(SETTINGS, {})
-    hooks = s.setdefault("hooks", {})
+def our_entry(sub, agent=None, matcher=True):
+    """One hook entry, exactly as we write it. The --agent flag is what makes the reporter
+    sure who fired: the line lives in that agent's own file, so it can simply say.
+
+    Only Claude gets a matcher. Muse silently runs no hook at all from a group that has
+    one — measured, by watching a live Muse window fire nothing from a file identical
+    except for that key — and Codex uses a matcher to name tools, not to mean "any"."""
+    cmd = " ".join(["agent-ws", "hook", sub]
+                   + ([f"--agent", agent] if agent else []) + state_flag())
+    entry = {"hooks": [{"type": "command", "command": cmd, "timeout": HOOK_TIMEOUT}]}
+    return {"matcher": "*", **entry} if matcher else entry
+
+def ours(sub, agent, matcher):
+    """Every shape we have ever written for this hook. The one without --agent is what
+    versions before three-agent support installed; an upgrade must still take it back."""
+    return [our_entry(sub, agent, matcher), our_entry(sub, None, matcher)]
+
+def installed(cfg):
+    return shutil.which(cfg["bin"]) is not None
+
+def backup(path):
+    """A copy of the file as it was, once, before we first change it. We never restore it
+    ourselves — uninstall takes back our own entries — it is there if a hand slips."""
+    if not os.path.exists(path): return
+    bak = f"{path}.agent-workspaces.bak"
+    if os.path.exists(bak): return
+    shutil.copy2(path, bak)
+    record(backups=sorted(set(recorded("backups", []) + [bak])))
+
+def hooks_install_one(cfg):
+    """Add our hooks to one agent's config. Anything already there is left exactly as it
+    is — including a hook of the user's own that happens to call agent-ws."""
+    if not installed(cfg): return "not installed, skipped"
+    path = cfg["path"]
+    existed = os.path.exists(path) and open(path).read().strip()
+    doc = read_json(path, {})
+    if not isinstance(doc, dict): raise Bad(path)
+    hooks = doc.setdefault("hooks", {})
+    if not isinstance(hooks, dict): raise Bad(path)
     added = []
-    for event, sub in HOOKS.items():
+    for event, sub in cfg["events"].items():
         entries = hooks.setdefault(event, [])
-        if our_entry(sub) in entries: continue
-        entries.append(our_entry(sub))
+        if not isinstance(entries, list): raise Bad(path)
+        if any(e in ours(sub, cfg["name"], cfg["matcher"]) for e in entries): continue
+        entries.append(our_entry(sub, cfg["name"], cfg["matcher"]))
         added.append(event)
     if added:
-        write_json(SETTINGS, s)
-        record(hooks=sorted(set(recorded("hooks", []) + added)),
-               settings_made=bool(recorded("settings_made")) or not existed)
+        backup(path)
+        write_json(path, doc)
+        key = f"hooks_{cfg['name']}"
+        record(**{key: sorted(set(recorded(key, []) + added)),
+                  f"made_{cfg['name']}": bool(recorded(f"made_{cfg['name']}")) or not existed})
     return f"added {len(added)}" if added else "already there"
 
-def hooks_remove():
-    """Take out exactly the entries install put in. A hook of the user's own that calls
-    agent-ws is theirs, not ours, and stays."""
-    s = read_json(SETTINGS, {})
-    hooks = s.get("hooks", {})
+def hooks_remove_one(cfg):
+    """Take out exactly the entries install put in, in any shape we have ever written.
+    A hook of the user's own that calls agent-ws is theirs, not ours, and stays — including
+    one that happens to be written exactly as we would write it. Install skipped that event
+    rather than adding a second copy, so it was never recorded as ours, and only what was
+    recorded is taken back."""
+    doc = read_json(cfg["path"], {})
+    if not isinstance(doc, dict): return "nothing to remove"
+    hooks = doc.get("hooks", {})
     if not isinstance(hooks, dict): return "nothing to remove"
+    mine_events = set(recorded(f"hooks_{cfg['name']}", []))
     removed = 0
-    for event, sub in HOOKS.items():
+    for event, sub in cfg["events"].items():
+        if event not in mine_events: continue
         entries = hooks.get(event)
         if not isinstance(entries, list): continue
-        keep = [e for e in entries if e != our_entry(sub)]
+        mine = ours(sub, cfg["name"], cfg["matcher"])
+        keep = [e for e in entries if e not in mine]
         removed += len(entries) - len(keep)
         if keep: hooks[event] = keep
         else: hooks.pop(event)
     if removed:
-        if not hooks: s.pop("hooks", None)
-        if recorded("settings_made") and not s: remove_file(SETTINGS)
-        else: write_json(SETTINGS, s)
+        if not hooks: doc.pop("hooks", None)
+        # `settings_made` is what versions before three-agent support recorded for Claude;
+        # without it an upgrade then an uninstall left behind an empty file we had created.
+        made = recorded(f"made_{cfg['name']}") or (cfg["name"] == "claude" and recorded("settings_made"))
+        if made and not doc:
+            remove_file(cfg["path"])
+            # the folder too, if we are the ones who made it and nothing else moved in
+            with contextlib.suppress(OSError): os.rmdir(os.path.dirname(cfg["path"]))
+        else: write_json(cfg["path"], doc)
+    for bak in recorded("backups", []):
+        if bak == f"{cfg['path']}.agent-workspaces.bak": remove_file(bak)
     return f"removed {removed}" if removed else "none of ours found"
+
+MUSE_PLUGIN = "agent-workspaces"
+
+def muse(*args):
+    """Run one of Muse's own plugin commands, in the user's environment."""
+    return subprocess.run(["muse", "plugins", *args], capture_output=True, text=True)
+
+def muse_install(src):
+    """Muse reads a hook file only from the folder you are working in, so there is no
+    single file we could write that would cover every project — measured, by watching a
+    live Muse window fire nothing from a hook file in every other place it might look.
+    Its supported way to add something once, for the whole account, is a plugin, which is
+    what we ship. Installing resets its trust, so approving always follows installing."""
+    if not shutil.which("muse"): return "not installed, skipped"
+    bundle = f"{src}/muse-plugin"
+    if not os.path.isdir(bundle): return "the plugin is missing from this download"
+    if state_flag():
+        # A shipped manifest cannot know this machine's state folder, so it is written in
+        # on a copy; the download itself is never edited.
+        bundle = f"{STATE}/muse-plugin"
+        shutil.rmtree(bundle, ignore_errors=True)
+        shutil.copytree(f"{src}/muse-plugin", bundle)
+        man = f"{bundle}/.muse-plugin/plugin.json"
+        d = read_json(man, {})
+        for h in d.get("capabilities", {}).get("hooks", []):
+            h["command"] = list(h.get("command", [])) + state_flag()
+        write_json(man, d)
+    r = muse("install", bundle, "--scope", "user")
+    if r.returncode != 0: return f"muse refused it: {r.stderr.strip().splitlines()[-1:] or ''}"
+    record(muse_plugin=True)      # recorded before approving, so a half-done install is still ours to remove
+    a = muse("approve", MUSE_PLUGIN)
+    if a.returncode != 0: return f"installed, but muse would not approve it: {a.stderr.strip()}"
+    return "installed and approved"
+
+def muse_remove():
+    """Only ever remove the plugin we put there ourselves."""
+    if not shutil.which("muse"): return "none found"
+    if not recorded("muse_plugin"): return "none of ours found"
+    r = muse("remove", MUSE_PLUGIN)
+    return "removed" if r.returncode == 0 else f"muse would not remove it: {r.stderr.strip()}"
 
 def prune_empty(s, made):
     """Drop the containers install had to invent, if nothing else moved into them."""
@@ -254,7 +376,9 @@ def reload_hypr():
 def install(src):
     print("Agent Workspaces")
     say("agent-ws ->", BIN, "…", step(bin_install, src))
-    say("Claude Code hooks …", step(hooks_install))
+    for cfg in AGENT_CONFIGS:
+        say(f"{cfg['label']} hooks …", step(hooks_install_one, cfg))
+    say("Muse Code hooks …", step(muse_install, src))
     say("keybindings …", step(block, BINDINGS, BINDINGS_BLOCK))
     say("login autostart …", step(block, AUTOSTART, AUTOSTART_BLOCK))
     say("bar widget …", step(bar_install))
@@ -264,6 +388,8 @@ def install(src):
     say("`agent-ws launch` opens a session in the workspace you are on, or brings back the")
     say("ones a named workspace remembers. It is deliberately not bound to anything — pick")
     say("your own key for it. See the README.")
+    for cfg in AGENT_CONFIGS:
+        if cfg.get("after") and installed(cfg): say("note:", cfg["after"] + ".")
     if os.path.expanduser("~/.local/bin") not in os.environ.get("PATH", "").split(":"):
         say("note: ~/.local/bin is not on your PATH; the keybindings will not find agent-ws")
     reload_hypr(); restart_shell()
@@ -272,7 +398,9 @@ def install(src):
 def uninstall(src):
     print("Removing Agent Workspaces")
     say("bar widget …", step(bar_remove))
-    say("Claude Code hooks …", step(hooks_remove))
+    for cfg in AGENT_CONFIGS:
+        say(f"{cfg['label']} hooks …", step(hooks_remove_one, cfg))
+    say("Muse Code hooks …", step(muse_remove))
     say("keybindings …", step(unblock, BINDINGS))
     say("login autostart …", step(unblock, AUTOSTART))
     say("agent-ws …", step(bin_remove))

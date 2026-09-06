@@ -5,7 +5,13 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 pass=0; fail=0
 check() { if [[ $2 == "$3" ]]; then echo "  ok   $1"; ((pass++)); else echo "  FAIL $1"; echo "       want: $3"; echo "       got:  $2"; ((fail++)); fi; }
+unset XDG_CONFIG_HOME XDG_STATE_HOME XDG_DATA_HOME
 newhome() { S="$(mktemp -d)"; mkdir -p "$S/.claude" "$S/.config/omarchy" "$S/.config/hypr" "$S/.local/bin"; }
+# A machine where only some of the three agents are installed: PATH is trimmed to a stub
+# directory holding just the ones named.
+onlyagents() { P="$(mktemp -d)"
+  for a in "$@"; do printf '#!/bin/sh\necho "$0 $*" >> "%s/calls.txt"\n' "$P" > "$P/$a"; chmod +x "$P/$a"; done; }
+runwith() { HOME="$S" PATH="$P:/usr/bin:/bin" AGENT_WS_NO_RELOAD=1 "$HERE/$1" 2>&1; }
 run() { HOME="$S" AGENT_WS_NO_RELOAD=1 "$HERE/$1" 2>&1; }
 j() { python3 -c "import json,sys;print(json.dumps(json.load(open(sys.argv[1])),sort_keys=True))" "$1" 2>/dev/null; }
 
@@ -70,10 +76,107 @@ echo "a shell.json with a syntax error"
 newhome; run install >/dev/null
 echo '{"bar": ' > "$S/.config/omarchy/shell.json"
 out="$(run uninstall)"
-check "still removes the hooks"       "$(grep -c 'hooks … removed 5' <<<"$out")" "1"
+check "still removes the hooks"       "$(grep -c 'Claude Code hooks … removed 6' <<<"$out")" "1"
 check "still removes the keybindings" "$(grep -c 'keybindings … removed' <<<"$out")" "1"
 check "still removes agent-ws"        "$(test -e "$S/.local/bin/agent-ws" && echo yes || echo no)" "no"
 rm -rf "$S"
+
+echo "all three agents installed"
+newhome; onlyagents claude codex muse; runwith install >/dev/null
+check "writes Codex's own hook file"  "$(test -e "$S/.codex/hooks.json" && echo yes || echo no)" "yes"
+check "installs Muse's plugin and approves it in one go" \
+  "$(grep -cE 'plugins install .* --scope user|plugins approve agent-workspaces' "$P/calls.txt")" "2"
+check "every line says which agent fired it" \
+  "$(python3 -c "
+import json
+n=0
+for f in ('$S/.claude/settings.json','$S/.codex/hooks.json'):
+    for ev in json.load(open(f))['hooks'].values():
+        for g in ev:
+            for h in g['hooks']:
+                if h['command'].startswith('agent-ws hook') and '--agent ' in h['command']: n+=1
+print(n)")" "12"
+check "Codex is asked for the user by permission request, not notification" \
+  "$(python3 -c "
+import json
+ks=set(json.load(open('$S/.codex/hooks.json'))['hooks'])
+print('PermissionRequest' in ks, 'Notification' in ks)")" "True False"
+check "the Muse plugin names the agent in every line too" \
+  "$(python3 -c "
+import json
+hs=json.load(open('$HERE/muse-plugin/.muse-plugin/plugin.json'))['capabilities']['hooks']
+print(len(hs), all(h['command'][:2]==['agent-ws','hook'] and h['command'][-2:]==['--agent','muse'] for h in hs))")" "6 True"
+check "a second install changes nothing" "$(grep -c 'hooks … already there' <<<"$(runwith install)")" "2"
+runwith uninstall >/dev/null
+check "takes back the files and the folders it made" \
+  "$(test -e "$S/.codex/hooks.json" -o -d "$S/.codex" && echo left || echo clean)" "clean"
+check "and takes the Muse plugin back out" "$(grep -c 'plugins remove agent-workspaces' "$P/calls.txt")" "1"
+rm -rf "$S" "$P"
+
+echo "a machine with Claude only"
+newhome; onlyagents claude; runwith install > "$S/out.txt" 2>&1
+check "says the other two are skipped" "$(grep -c 'not installed, skipped' "$S/out.txt")" "2"
+check "writes nothing into their config" \
+  "$(test -e "$S/.codex/hooks.json" && echo wrote || echo none)" "none"
+check "and asks Muse for nothing" "$(test -e "$P/calls.txt" && grep -c plugins "$P/calls.txt" || echo 0)" "0"
+check "still wires Claude" "$(grep -c 'Claude Code hooks … added 6' "$S/out.txt")" "1"
+rm -rf "$S" "$P"
+
+echo "an agent config of the user's own, with their hooks already in it"
+newhome; onlyagents claude codex muse
+mkdir -p "$S/.codex"
+cat > "$S/.codex/hooks.json" <<'J'
+{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"bash /theirs.sh","timeout":10}]}]}}
+J
+theirs="$(j "$S/.codex/hooks.json")"
+runwith install >/dev/null; runwith uninstall >/dev/null
+check "their file comes back exactly as it was" "$(j "$S/.codex/hooks.json")" "$theirs"
+check "and it is not deleted from under them" "$(test -e "$S/.codex/hooks.json" && echo yes || echo no)" "yes"
+rm -rf "$S" "$P"
+
+echo "a hook of the user's own, written exactly the way we would write it"
+newhome; onlyagents claude
+python3 - "$S" <<'P'
+import json, sys
+s = sys.argv[1]
+theirs = {"matcher": "*", "hooks": [{"type": "command",
+          "command": "agent-ws hook session-start --agent claude", "timeout": 10}]}
+json.dump({"model": "opus", "hooks": {"SessionStart": [theirs]}},
+          open(f"{s}/.claude/settings.json", "w"), indent=2)
+P
+before="$(j "$S/.claude/settings.json")"
+out="$(runwith install)"
+check "install adds five, not six, because theirs already covers one" \
+  "$(grep -c 'Claude Code hooks … added 5' <<<"$out")" "1"
+runwith uninstall >/dev/null
+check "their line survives uninstall" "$(j "$S/.claude/settings.json")" "$before"
+rm -rf "$S" "$P"
+
+echo "a machine whose state folder is not the usual one"
+newhome; onlyagents claude codex muse
+mkdir -p "$S/.state"
+HOME="$S" XDG_STATE_HOME="$S/.state" PATH="$P:/usr/bin:/bin" AGENT_WS_NO_RELOAD=1 "$HERE/install" >/dev/null 2>&1
+check "every hook line carries the folder, so a hook stripped of its environment still finds it" \
+  "$(python3 -c "
+import json
+n = 0
+for f in ('$S/.claude/settings.json', '$S/.codex/hooks.json'):
+    for ev in json.load(open(f))['hooks'].values():
+        for g in ev:
+            for h in g['hooks']:
+                if '--state $S/.state/omarchy/agent-workspaces' in h['command']: n += 1
+print(n)")" "12"
+check "and so does the copy of the plugin it installs" \
+  "$(python3 -c "
+import json
+hs = json.load(open('$S/.state/omarchy/agent-workspaces/muse-plugin/.muse-plugin/plugin.json'))['capabilities']['hooks']
+print(len(hs), all(h['command'][-2:] == ['--state', '$S/.state/omarchy/agent-workspaces'] for h in hs))")" "6 True"
+check "the download itself is left alone" \
+  "$(python3 -c "
+import json
+hs = json.load(open('$HERE/muse-plugin/.muse-plugin/plugin.json'))['capabilities']['hooks']
+print(any('--state' in h['command'] for h in hs))")" "False"
+rm -rf "$S" "$P"
 
 echo "someone else's agent-ws already on the PATH"
 newhome; echo "#!/bin/sh" > "$S/.local/bin/agent-ws"; chmod +x "$S/.local/bin/agent-ws"
