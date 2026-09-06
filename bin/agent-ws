@@ -52,10 +52,6 @@ def needs_by_event(event, data):
     it carries no notification_type, so the event name is all there is to read."""
     return canon(event) == "permissionrequest"
 
-def needs_by_either(event, data):
-    """Muse has both: a PermissionRequest event, and Claude's notification_type names —
-    its binary carries `notification_type` next to `permission_prompt`."""
-    return needs_by_type(event, data) or needs_by_event(event, data)
 
 def exit_by_reason(event, data):
     """Claude's /exit, as against a window that merely closed."""
@@ -102,16 +98,20 @@ AGENTS = (
      "cmd": ("codex",), "resume": ("resume", "{sid}"),
      "needs": needs_by_event, "exiting": never_exits},
     # Muse Code: a wrapper script named `muse` that execs `muse-bin-<version>`, which is
-    # the process the hook actually hangs under. Its payloads are Claude-shaped too.
+    # the process the hook actually hangs under. Every key below was read off a payload
+    # captured from a live Muse window, not from the binary: cwd, session_id, turn_id,
+    # hook_event_name, model, permission_mode, and transcript_path, which is always null.
+    # Its needs-you is PermissionRequest, the same as Codex: Muse fires no notification
+    # event at all and sends no notification_type, so there is nothing else to read.
     {"name": "muse",
      "procs": ("muse", "muse-bin-*"),
      "flags": (),
      "subcommands": ("exec",),
-     "sid": ("session_id", "sessionId", "conversation_id"),
-     "cwd": ("cwd", "working_directory", "workdir"),
-     "transcript": ("transcript_path", "session_path"),
+     "sid": ("session_id",),
+     "cwd": ("cwd",),
+     "transcript": ("transcript_path",),
      "cmd": ("muse",), "resume": ("resume", "{sid}"),
-     "needs": needs_by_either, "exiting": never_exits},
+     "needs": needs_by_event, "exiting": never_exits},
 )
 AGENT_ROWS = {a["name"]: a for a in AGENTS}
 DEFAULT_AGENT = "claude"      # what an old record with no agent field was, and the fresh launch
@@ -236,12 +236,37 @@ def update(path, fn, default=None):
         if new is not None: save(path, new)
         return new
 
+_HYPR_ENV = None
+
+def hypr_env():
+    """The environment hyprctl needs, found for ourselves when we were not given it.
+
+    Muse and Codex run their hooks with a scrubbed environment - HOME, PATH, PWD, SHELL,
+    TERM, USER and nothing else, measured from inside a live hook of each. Neither
+    HYPRLAND_INSTANCE_SIGNATURE nor XDG_RUNTIME_DIR survives, so hyprctl has no socket to
+    talk to and every such session would register with no window. Both are recoverable
+    from the runtime directory: one directory per running compositor, newest first."""
+    global _HYPR_ENV
+    if _HYPR_ENV is not None: return _HYPR_ENV
+    env = dict(os.environ)
+    run = env.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    if os.path.isdir(f"{run}/hypr"): env["XDG_RUNTIME_DIR"] = run
+    if not env.get("HYPRLAND_INSTANCE_SIGNATURE"):
+        try:
+            live = [(os.path.getmtime(f"{run}/hypr/{d}"), d) for d in os.listdir(f"{run}/hypr")
+                    if os.path.exists(f"{run}/hypr/{d}/.socket.sock")]
+        except OSError: live = []
+        if live: env["HYPRLAND_INSTANCE_SIGNATURE"] = max(live)[1]
+    _HYPR_ENV = env
+    return env
+
 def hypr(*args):
-    out = subprocess.run(["hyprctl", "-j", *args], capture_output=True, text=True).stdout
+    out = subprocess.run(["hyprctl", "-j", *args], capture_output=True, text=True,
+                         env=hypr_env()).stdout
     return json.loads(out) if out.strip() else None
 
 def dispatch(lua):
-    subprocess.run(["hyprctl", "dispatch", lua], capture_output=True)
+    subprocess.run(["hyprctl", "dispatch", lua], capture_output=True, env=hypr_env())
 
 def clients():
     """Hyprland's windows, or None when we could not ask at all (no hyprctl, no compositor,
@@ -333,6 +358,17 @@ def normalize(data, row):
         return ""
     return {"sid": first(row["sid"]), "cwd": first(row["cwd"]),
             "transcript": first(row["transcript"])}
+
+def is_helper(data):
+    """A helper Muse runs inside a session fires the same events, under an id of its own.
+
+    Measured on the wire: in one live run the events carried three session ids, the real
+    one and two helpers, and in every helper case the session id was exactly the turn id
+    while the real session's two always differed. One of the helper events asked for the
+    user - taken at face value it would raise the hand on a session that owns no window,
+    and could then clear the real one's."""
+    sid, turn = data.get("session_id"), data.get("turn_id")
+    return bool(sid) and sid == turn
 
 def headless(row, args, i):
     """True for `claude -p` and the other agents' headless equivalents. Those fire the
@@ -626,6 +662,7 @@ def hook(event, agent=None):
         elif row["name"] not in spellers: return
     if headless(row, args, i): return
     agent = row["name"]
+    if is_helper(data): return         # a helper of the session, not the session itself
     norm = normalize(data, row)
     sid = norm["sid"]
     if internal == "session-start":
