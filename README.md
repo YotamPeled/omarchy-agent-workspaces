@@ -61,8 +61,8 @@ otherwise, which is what covers an agent that has gone quiet.
 A session names its own workspace. The name comes from the title the agent gives the chat:
 first a name derived on the spot, then a better one from Haiku about seven seconds later,
 cached so a title costs one call ever. Codex titles its window with the folder it was started
-in rather than the work, so for Codex the name comes from the first thing you asked it — read
-once, from the session's own transcript, so the slot does not rename itself all evening.
+in rather than the work, so for Codex the name comes from the request the session opened with —
+read once, from the session's own transcript, so the slot does not rename itself all evening.
 
 - `Localsend not finding iPhone on omarchy` → `localsend-ios`
 - `Build story engine compose.py with beat vocabulary` → `compose-beats`

@@ -37,10 +37,16 @@ fire UserPromptSubmit codex '{"session_id":"sid-codex","turn_id":"t2","cwd":"/ho
 check "keeps the name it already has, so the slot does not rename itself all evening" \
   "$(field sid-codex about)" "take a look at the boxes project and see if we can get better results there"
 
-echo "a payload that carries the prompt outright"
+echo "a payload that carries the prompt outright, on a session already under way"
 seed sid-codex2 codex "$S/rollout.jsonl"
 fire UserPromptSubmit codex '{"session_id":"sid-codex2","turn_id":"t1","prompt":"rename the odds column"}'
-check "prefers it over reading the transcript" "$(field sid-codex2 about)" "rename the odds column"
+check "loses to the request the session opened with, which is what the workspace is for" \
+  "$(field sid-codex2 about)" "take a look at the boxes project and see if we can get better results there"
+
+echo "the first prompt of a brand-new session, which the hook sees before the transcript does"
+seed sid-codex4 codex "$S/notyet.jsonl"
+fire UserPromptSubmit codex '{"session_id":"sid-codex4","turn_id":"t1","prompt":"rename the odds column"}'
+check "is taken from the payload instead" "$(field sid-codex4 about)" "rename the odds column"
 
 echo "an agent that writes the work into its own window title"
 seed sid-claude claude "$S/rollout.jsonl"
