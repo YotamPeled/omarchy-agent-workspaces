@@ -7,7 +7,11 @@
   agent-ws launch            Super+Shift+A: resume the workspace's remembered sessions, else fresh
   agent-ws reset [--all]     put the workspace back to a bare number: no name, nothing remembered
   agent-ws slug TITLE        print the short label for a session title (heuristic, then cached AI)
-  agent-ws hook EVENT        Claude Code hook entry point (stdin JSON)
+  agent-ws hook EVENT [--agent NAME]
+                             agent hook entry point; EVENT is any name Claude, Codex or
+                             Muse fires (SessionStart, session_start, session-start …).
+                             --agent is the agent whose config carries this hook line and
+                             settles who fired it; without it we ask the process tree.
   agent-ws state             dump state (debug)
 
 Config  ~/.config/omarchy/workspace-names.json   {"2": "rss-digest"}   workspace id -> its name
@@ -24,6 +28,169 @@ NEEDS_TYPES = ("permission_prompt", "agent_needs_input", "elicitation")  # idle_
 NEEDS_TTL = 3600      # Hyprland reuses window addresses, so a flag must not outlive its window
 SLUG_CAP = 2000       # one entry per session title ever seen; bounded so the file cannot grow forever
 LOG_CAP = 262144
+
+# ---------- agents ----------
+# One row per supported agent: how to recognise its process, which of its runs own no
+# window, which payload keys carry what, and how it says "I need you" and "I am done".
+# Everything below reads off this table, so a fourth agent is one more row here.
+#
+# The keys and the event names are what the binaries actually contain, not what any doc
+# says: `strings` on the codex and muse-bin binaries, and their --help for the subcommands.
+
+def canon(s):
+    """One spelling for one event: SessionStart, session_start, session-start and
+    pre-tool-use / PreToolUse / pre_tool_use all collapse. Used only after the exact
+    table has missed, so a native name nobody listed verbatim still lands somewhere."""
+    return re.sub(r"[^a-z0-9]", "", str(s).lower())
+
+def needs_by_type(event, data):
+    """Claude names the kind of notification in notification_type."""
+    return str(data.get("notification_type", "")).startswith(NEEDS_TYPES)
+
+def needs_by_event(event, data):
+    """Codex has no Notification event at all: PermissionRequest is the whole signal, and
+    it carries no notification_type, so the event name is all there is to read."""
+    return canon(event) == "permissionrequest"
+
+def needs_by_either(event, data):
+    """Muse has both: a PermissionRequest event, and Claude's notification_type names —
+    its binary carries `notification_type` next to `permission_prompt`."""
+    return needs_by_type(event, data) or needs_by_event(event, data)
+
+def exit_by_reason(event, data):
+    """Claude's /exit, as against a window that merely closed."""
+    return data.get("reason") == "prompt_input_exit"
+
+def never_exits(event, data):
+    """Neither binary contains `prompt_input_exit`, and the SessionEnd reason we saw on
+    the wire is a bare "other": nothing tells a deliberate exit from a closed window.
+    Keeping the session is the safe way to be wrong — it stays resumable."""
+    return False
+
+# One row per supported agent.
+#   procs        whole process basenames; a trailing * is the only prefix allowed, so
+#                `museum` and `codex-notify.sh` are not agents
+#   flags        headless switches, matched anywhere in argv (they are order-free)
+#   subcommands  headless subcommands; a token that is one of these is a subcommand
+#                unless it sits where a flag's value goes (see headless())
+#   sid/cwd/transcript   payload keys, the ones seen on the wire first
+#   cmd          how to start this agent fresh
+#   resume       argv that reopens one of its sessions, () for an agent that cannot;
+#                taken from each binary's own --help, not from a doc:
+#                `claude --resume <id>` · `codex resume <SESSION_ID>` · `muse resume <session-uuid>`
+AGENTS = (
+    # Claude Code, the original agent: these keys are exactly what hook() always read.
+    {"name": "claude",
+     "procs": ("claude", "claude-code"),
+     "flags": ("-p", "--print"),           # `claude -p` fires hooks but owns no window
+     "subcommands": (),
+     "sid": ("session_id",),
+     "cwd": ("cwd",),
+     "transcript": ("transcript_path",),
+     "cmd": ("claude",), "resume": ("--resume", "{sid}"),
+     "needs": needs_by_type, "exiting": exit_by_reason},
+    # Codex. `-p` here is --profile and is windowed (`codex --help`); the headless runs
+    # are subcommands. A captured SessionStart payload carries Claude's own key names;
+    # the rest are accepted as a fallback but were never seen on the wire.
+    {"name": "codex",
+     "procs": ("codex",),
+     "flags": (),
+     "subcommands": ("exec", "e", "review"),
+     "sid": ("session_id", "conversation_id", "conversationId", "sessionId"),
+     "cwd": ("cwd", "working_directory", "workdir"),
+     "transcript": ("transcript_path", "rollout_path"),
+     "cmd": ("codex",), "resume": ("resume", "{sid}"),
+     "needs": needs_by_event, "exiting": never_exits},
+    # Muse Code: a wrapper script named `muse` that execs `muse-bin-<version>`, which is
+    # the process the hook actually hangs under. Its payloads are Claude-shaped too.
+    {"name": "muse",
+     "procs": ("muse", "muse-bin-*"),
+     "flags": (),
+     "subcommands": ("exec",),
+     "sid": ("session_id", "sessionId", "conversation_id"),
+     "cwd": ("cwd", "working_directory", "workdir"),
+     "transcript": ("transcript_path", "session_path"),
+     "cmd": ("muse",), "resume": ("resume", "{sid}"),
+     "needs": needs_by_either, "exiting": never_exits},
+)
+AGENT_ROWS = {a["name"]: a for a in AGENTS}
+DEFAULT_AGENT = "claude"      # what an old record with no agent field was, and the fresh launch
+
+# A payload field naming the agent. Third in line: `--agent` on the hook line settles it,
+# then the process tree, and this only counts when the tree gives nothing either, which is
+# pipes and tests, never a real hook firing. `source` is deliberately not here: both Codex
+# and Muse send source="startup" on SessionStart.
+AGENT_KEYS = ("agent", "agent_name", "agentName", "cli")
+
+# Every native event name the three agents fire -> the internal event it means, and the
+# agents that spell it that way, the likeliest first.
+#   dashed short names  our own short spellings; five of them are what install writes
+#   PascalCase          Claude Code's own vocabulary, which Codex and Muse both copied
+#   snake_case          Codex's and Muse's config spellings, never Claude's
+# Every name below is in one of the two binaries (`strings`) or in setup.py's HOOKS.
+#
+# The agent list is what the tree fallback is checked against: with no --agent we take the
+# nearest agent above us and record nothing unless it spells this event. It is not used to
+# choose between two agents in the tree — the nearest one is the one that fired the hook.
+C, X, M = "claude", "codex", "muse"
+EVENTS = {
+    # the dashed names install writes into Claude's settings.json, all five of them;
+    # Codex accepts the dashed spellings too
+    "session-start": ("session-start", (C, X)),
+    "session-end":   ("session-end",   (C, X)),
+    "notification":  ("notification",  (C, M)),   # Codex has no notification event
+    "prompt-submit": ("prompt-submit", (C,)),     # our own short name: Claude only
+    "pre-tool":      ("pre-tool",      (C,)),     # our own short name: Claude only
+    # install wires no stop hook at all — the five above are the whole set it writes.
+    # This dashed spelling is here for a stop hook someone wires by hand; the codex
+    # binary carries `stop` as well as `Stop`.
+    "stop":          ("stop",          (C, X, M)),
+    # the shared PascalCase vocabulary
+    "SessionStart":      ("session-start", (X, M, C)),
+    "SessionEnd":        ("session-end",   (X, M, C)),
+    "Notification":      ("notification",  (M, C)),
+    "UserPromptSubmit":  ("prompt-submit", (X, M, C)),
+    "PreToolUse":        ("pre-tool",      (X, M, C)),
+    "PostToolUse":       ("pre-tool",      (X, M, C)),   # a tool ran: still working
+    "Stop":              ("stop",          (X, M, C)),
+    "Interrupt":         ("stop",          (X,)),        # Esc mid-turn: Codex only
+    "PreCompact":        ("pre-tool",      (X, M, C)),   # compaction happens mid-turn
+    "PostCompact":       ("pre-tool",      (X, M)),
+    "SubagentStart":     ("pre-tool",      (X, M)),
+    "SubagentStop":      ("pre-tool",      (X, M, C)),   # the session works on after one stops
+    "PermissionRequest": ("notification",  (X, M)),      # the needs-you signal for both
+    # the snake_case spellings, which Claude never uses
+    "session_start":       ("session-start", (M, X)),
+    "session_end":         ("session-end",   (M, X)),
+    "user_prompt_submit":  ("prompt-submit", (M, X)),
+    "pre_tool_use":        ("pre-tool",      (M, X)),
+    "post_tool_use":       ("pre-tool",      (M, X)),
+    "permission_request":  ("notification",  (X, M)),
+}
+# The same table by collapsed spelling, unioning the agents of every spelling that
+# collapses to it. A native name we did not list verbatim (Codex's `pre-tool-use`,
+# `subagent_stop`, …) still lands on the right internal event instead of falling through.
+CANON_EVENTS = {}
+for _native, (_internal, _who) in EVENTS.items():
+    _key = canon(_native)
+    _prev = CANON_EVENTS.get(_key, (_internal, ()))[1]
+    CANON_EVENTS[_key] = (_internal, tuple(dict.fromkeys(_prev + _who)))
+
+def resolve_event(name):
+    """(internal event, the agents that spell it this way), or None for a name we do not
+    know. Exact first, then the collapsed spelling; only a genuinely foreign name misses."""
+    return EVENTS.get(name) or CANON_EVENTS.get(canon(name))
+
+# What each internal event says about the session: working, idle, or nothing.
+STATE_OF = {"prompt-submit": "working", "pre-tool": "working", "stop": "idle"}
+
+# The native events that only *continue* work: a tool call or a subagent finished. They
+# keep a working session working, but they must never wake an idle one — a subagent's
+# completion lands after its parent has already stopped often enough to matter, and the
+# bar then shows a workspace working at nothing until the next prompt.
+CONTINUES = {canon(n) for n in ("PostToolUse", "post_tool_use", "PostCompact", "SubagentStop")}
+
+WALK = 40      # how far up the process tree every walk here looks, and they all agree
 
 # ---------- small io ----------
 class Corrupt(Exception):
@@ -76,22 +243,118 @@ def hypr(*args):
 def dispatch(lua):
     subprocess.run(["hyprctl", "dispatch", lua], capture_output=True)
 
-def is_print_run():
-    """True for `claude -p`. Those fire the same hooks but own no window, so without this
-    they get filed against whatever terminal happens to be up the process tree."""
-    if os.environ.get("AGENT_WS_INTERNAL"): return True
-    pid = os.getppid()
-    for _ in range(8):
-        try:
-            with open(f"/proc/{pid}/cmdline", "rb") as f:
-                args = [a.decode("utf-8", "replace") for a in f.read().split(b"\0") if a]
-        except OSError: return False
-        if any(os.path.basename(a).startswith("claude") for a in args[:2]):
-            return any(a in ("-p", "--print") for a in args)
-        try:
-            with open(f"/proc/{pid}/stat") as f: pid = int(f.read().split(")")[-1].split()[1])
-        except (OSError, ValueError): return False
-        if pid <= 1: return False
+def clients():
+    """Hyprland's windows, or None when we could not ask at all (no hyprctl, no compositor,
+    a truncated answer). Never [] for "we do not know": every "is this window still there"
+    below turns on that difference, and one failed call must not retire every session."""
+    try: out = hypr("clients")
+    except (OSError, ValueError): return None
+    return out if isinstance(out, list) else None
+
+def cmdline(pid):
+    """argv of a pid, [] if it is gone. Split out so detection and headless share it."""
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            return [a.decode("utf-8", "replace") for a in f.read().split(b"\0") if a]
+    except OSError: return []
+
+def ppid(pid):
+    """Parent of a pid; 1 when unreadable so callers just stop at init."""
+    try:
+        with open(f"/proc/{pid}/stat") as f: return int(f.read().split(")")[-1].split()[1])
+    except (OSError, ValueError): return 1
+
+def ancestry(pid=None):
+    """This process' command line and its ancestors', nearest first, WALK deep. An
+    ancestor whose command line we cannot read is skipped, not a wall: a kernel thread
+    or a process we may not read must not hide the terminal above it."""
+    pid = os.getppid() if pid is None else pid
+    for _ in range(WALK):
+        yield pid, cmdline(pid)
+        pid = ppid(pid)
+        if pid <= 1: return
+
+def proc_is(base, pat):
+    """A whole basename, unless the pattern ends in *, which is the only prefix we allow.
+    `muse` must not match `museum` or `musescore`, and `codex` must not match
+    `codex-notify.sh` — both of those were filing sessions against the wrong agent."""
+    return base.startswith(pat[:-1]) if pat.endswith("*") else base == pat
+
+def agent_for_argv(args):
+    """(registry row, index of the token that named it) for this command line, or
+    (None, -1). args[:2] because the binary may sit behind an interpreter, the way the
+    old headless check always looked; the index is what tells a subcommand from a flag."""
+    for i, a in enumerate(args[:2]):
+        base = os.path.basename(a)
+        for ag in AGENTS:
+            if any(proc_is(base, p) for p in ag["procs"]): return ag, i
+    return None, -1
+
+def nearest_agent():
+    """The nearest ancestor that is an agent of any kind, as (row, argv, index of the
+    token that named it). Nearest, full stop: the agent a hook is running under is the
+    agent that fired it. Walking past it to one that spells this event filed a Muse
+    session against the Claude terminal it was started from."""
+    for _pid, args in ancestry():
+        ag, i = agent_for_argv(args)
+        if ag is not None: return ag, args, i
+    return None, [], -1
+
+def tree_argv(row):
+    """The nearest ancestor running this particular agent, as (argv, index), or ([], -1).
+    Called when --agent has already settled who fired the hook: the command line is wanted
+    only to tell a windowed run from a headless one."""
+    for _pid, args in ancestry():
+        ag, i = agent_for_argv(args)
+        if ag is not None and ag["name"] == row["name"]: return args, i
+    return [], -1
+
+def agent_from_payload(data, spellers):
+    """A payload field naming the agent, for a hook piped in by hand or by a test where
+    there is no agent in the process tree at all. Every key is looked at, not just the
+    first one present, and the answer still has to be an agent that spells this event."""
+    for k in AGENT_KEYS:
+        v = str(data.get(k, "")).lower()
+        for name in spellers:
+            if name in v: return AGENT_ROWS[name]
+    return None
+
+def normalize(data, row):
+    """One internal shape from any agent's stdin JSON. A field the agent does not send
+    stays empty: inventing a transcript would make launch try to resume nothing. Values
+    are coerced to str, so a numeric session id cannot become a key that never matches
+    the string one written next to it."""
+    def first(keys):
+        for k in keys:
+            v = data.get(k)
+            if v is None or isinstance(v, bool): continue   # Muse sends transcript_path: null
+            s = str(v).strip()
+            if s: return s
+        return ""
+    return {"sid": first(row["sid"]), "cwd": first(row["cwd"]),
+            "transcript": first(row["transcript"])}
+
+def headless(row, args, i):
+    """True for `claude -p` and the other agents' headless equivalents. Those fire the
+    same hooks but own no window, so without this they get filed against whatever
+    terminal happens to be up the process tree.
+
+    A flag counts anywhere in argv, because flags are order-free. A subcommand counts
+    anywhere after the binary *except* immediately after a flag, where it is that flag's
+    value: `codex --profile exec` runs the profile named exec in a window, while
+    `codex -m gpt-6-astra exec x` and `codex --config k=v exec x` are background runs that
+    the old "first non-switch token wins" rule read as windowed. Which flags take a value
+    is not knowable for three CLIs that keep moving, so position is all we go on; a flag
+    that carries its own value (`-c k=v`, `--model=x`) does not eat the next token."""
+    if any(a in row["flags"] for a in args): return True
+    after_flag = False
+    for a in args[i + 1:]:
+        if a == "--": after_flag = False; continue          # everything after is positional
+        if len(a) > 1 and a.startswith("-"):
+            after_flag = "=" not in a
+            continue
+        if not after_flag and a in row["subcommands"]: return True
+        after_flag = False
     return False
 
 def norm_addr(a):
@@ -126,23 +389,36 @@ def set_name(ws, name):
 def focused_ws(): return hypr("activeworkspace")["id"]
 
 def window_for_process(pid=None):
-    """Walk up the process tree until a pid owns a Hyprland window."""
-    clients = {c["pid"]: c for c in (hypr("clients") or [])}
-    pid = pid or os.getpid()
-    for _ in range(40):
-        if pid in clients: return clients[pid]
-        try:
-            with open(f"/proc/{pid}/stat") as f: pid = int(f.read().split(")")[-1].split()[1])
-        except (OSError, ValueError): break
-        if pid <= 1: break
+    """Walk up the process tree until a pid owns a Hyprland window. Same walk, same
+    depth and same tolerance of an unreadable ancestor as every other walk here."""
+    by_pid = {c["pid"]: c for c in (clients() or [])}
+    for p, _args in ancestry(pid or os.getpid()):
+        if p in by_pid: return by_pid[p]
     return None
 
+def owns_window(rec, win):
+    """Is this window the one that session is running in? Hyprland hands a closed window's
+    address straight to the next window, so the pid has to agree too where we recorded one."""
+    if norm_addr(rec.get("address", "")) != norm_addr(win.get("address")): return False
+    return not rec.get("pid") or rec["pid"] == win.get("pid")
+
 def session_windows(ws=None):
-    """Claude windows (title carries a status glyph), optionally in one workspace."""
-    # `"" in GLYPHS` is True, so an untitled window would count as a session. Require a glyph.
-    return [c for c in (hypr("clients") or [])
-            if (c.get("title") or "")[:1] and c["title"][0] in GLYPHS
-            and (ws is None or c["workspace"]["id"] == ws)]
+    """The windows holding a session, optionally in one workspace.
+
+    A session record pointing at the window is the test. Codex and Muse title their windows
+    however they like, so requiring Claude's status glyph meant a workspace full of Codex
+    sessions looked empty. The glyph stays as a second way in, because Claude paints it
+    before our own session-start hook has written anything — and it is Claude's *state*,
+    not the proof a session exists."""
+    open_recs = [r for r in sessions().values() if r.get("open") and r.get("address")]
+    out = []
+    for c in (clients() or []):
+        if ws is not None and c["workspace"]["id"] != ws: continue
+        t = c.get("title") or ""
+        # `"" in GLYPHS` is True, so an untitled window must not count on the glyph path.
+        if any(owns_window(r, c) for r in open_recs) or (t[:1] and t[0] in GLYPHS):
+            out.append(c)
+    return out
 
 # ---------- slugs ----------
 STOP = set("""a an the and or of to for in on at by with from into over under as is are was be been being
@@ -248,6 +524,33 @@ def keepable(rec):
 def prune():
     update(SESSIONS, lambda s: {k: v for k, v in s.items() if keepable(v)})
 
+WORK_TTL = 3600   # a session that says "working" and has fired no hook in an hour is not
+
+def reap(now=None):
+    """Close the sessions whose windows are gone, and cool down the ones that stopped
+    saying anything.
+
+    An agent killed with its terminal fires no session-end, so without this its record sat
+    open — and, if it was mid-turn, working — for ever: a workspace on the bar spinning at
+    nothing, and a resume that reopens a session nobody closed. The window is the real test;
+    the hour is the backstop for a session that is alive but has gone quiet mid-turn (one
+    long tool call fires no hook), where being wrong costs only a glyph.
+
+    Runs only when Hyprland actually answered. "No windows" and "could not ask" must not be
+    the same thing, or a single failed call retires every session on the machine."""
+    cs = clients()
+    if cs is None: return
+    now = now or time.time()
+    def f(s):
+        hit = False
+        for rec in s.values():
+            if rec.get("open") and not any(owns_window(rec, c) for c in cs):
+                rec.update(open=False, ended=now, state="idle", state_at=now); hit = True
+            elif rec.get("state") == "working" and now - rec.get("state_at", 0) > WORK_TTL:
+                rec.update(state="idle", state_at=now); hit = True
+        return s if hit else None
+    update(SESSIONS, f)
+
 def needs_write(fn):
     def f(n):
         cut = time.time() - NEEDS_TTL
@@ -268,45 +571,110 @@ def adopt_open_sessions(ws, name):
     update(SESSIONS, f)
 
 # ---------- hooks ----------
-def hook(event):
-    # A headless `claude -p` fires these hooks too but owns no window, so without this it
-    # gets filed against whatever terminal happens to be up its process tree.
-    if is_print_run(): return
-    data = json.load(sys.stdin) if not sys.stdin.isatty() else {}
-    sid = data.get("session_id", "")
-    if event == "session-start":
+def mark_state(sid, state, at, continuing=False):
+    """Working or idle on a session we already know, at the moment the event reached us.
+
+    Four things are refused, in the same lock as every other write:
+      · the state already on record — that is most tool calls, and it writes nothing;
+      · an event older than the state on record, because two hooks racing for this lock
+        are handled in whichever order they get it, not the order they fired;
+      · a continuation — a tool or a subagent finishing — waking an idle session;
+      · working on a session whose window has closed."""
+    if not sid or not state: return
+    def f(s):
+        rec = s.get(sid)
+        if rec is None or rec.get("state") == state: return None
+        if at <= rec.get("state_at", 0): return None
+        if state == "working" and (continuing or not rec.get("open")): return None
+        rec["state"] = state; rec["state_at"] = at
+        return s
+    update(SESSIONS, f)
+
+def clear_needs(sid):
+    """Drop the needs-you flags this session raised, and only those. Clearing by window
+    address instead let any other session sharing the window — a Claude started inside a
+    Codex terminal — answer a permission prompt it never saw, by running one tool."""
+    if not sid: return
+    needs_write(lambda n: {k: v for k, v in n.items()
+                           if not (isinstance(v, dict) and v.get("sid") == sid)})
+
+def hook(event, agent=None):
+    resolved = resolve_event(event)
+    if resolved is None: return        # a name none of the three fires: silent no-op
+    internal, spellers = resolved
+    # Our own `claude -p` call for a slug fires hooks too, and owns no window.
+    if os.environ.get("AGENT_WS_INTERNAL"): return
+    now = time.time()                  # when this event reached us, taken before any lock wait
+    try: data = json.load(sys.stdin) if not sys.stdin.isatty() else {}
+    except ValueError: data = {}                 # a hook must never hand the agent a traceback
+    if not isinstance(data, dict): data = {}
+    if agent is not None:
+        # The hook line lives in that agent's own config, so it says who fired it. No tree
+        # walk for identity: the tree cannot tell an agent from the one it was launched in.
+        row = AGENT_ROWS.get(agent)
+        if row is None: return         # an agent we do not support: nothing to record it as
+        args, i = tree_argv(row)       # only to tell a windowed run from a headless one
+    else:
+        # Wired by hand, with no --agent: the nearest agent above us is the one that fired
+        # this hook. If it cannot have fired *this event*, we record nothing rather than
+        # walk past it and file the session against some other agent's window.
+        row, args, i = nearest_agent()
+        if row is None:
+            row = agent_from_payload(data, spellers)
+            if row is None: return     # nobody we know called: an empty slot beats a wrong one
+            args, i = [], -1
+        elif row["name"] not in spellers: return
+    if headless(row, args, i): return
+    agent = row["name"]
+    norm = normalize(data, row)
+    sid = norm["sid"]
+    if internal == "session-start":
+        reap(now)
         win = window_for_process()
         if not win or not sid: return
         ws = win["workspace"]["id"]
-        remember(sid, cwd=data.get("cwd", ""), workspace=ws, name=ws_name(ws), open=True,
-                 address=norm_addr(win["address"]), pid=win["pid"], started=time.time(),
-                 transcript=data.get("transcript_path", ""))
-    elif event == "session-end":
+        prev = sessions().get(sid) or {}
+        # Compaction and /clear fire session-start again on a session that never stopped.
+        # That session keeps what it has: the transcript it is writing, and the state it is
+        # in — a re-start used to push a working slot back to idle and blank the transcript.
+        again = bool(prev.get("open")) and owns_window(prev, win)
+        # A session is idle until it is given something to do. Every agent gets the field,
+        # because only Claude spins a glyph into its title for the bar to read for free.
+        remember(sid, agent=agent, cwd=norm["cwd"] or prev.get("cwd", ""), workspace=ws,
+                 name=ws_name(ws), open=True, address=norm_addr(win["address"]),
+                 pid=win["pid"], started=prev.get("started", now) if again else now,
+                 transcript=norm["transcript"] or prev.get("transcript", ""),
+                 state=prev.get("state", "idle") if again else "idle",
+                 state_at=prev.get("state_at", now) if again else now)
+    elif internal == "session-end":
         if not sid: return
+        reap(now)
         # /exit is a deliberate end: forget. A closed window keeps the session resumable
-        # as long as Claude left a transcript; prune() below drops it if not, and launch
-        # re-checks, because Claude may still be flushing while this hook runs.
-        tp = data.get("transcript_path") or sessions().get(sid, {}).get("transcript", "")
-        if data.get("reason") == "prompt_input_exit": forget(sid)
-        elif sid in sessions(): remember(sid, open=False, ended=time.time(), transcript=tp)
+        # as long as the agent left a transcript; prune() below drops it if not, and launch
+        # re-checks, because the agent may still be flushing while this hook runs.
+        tp = norm["transcript"] or sessions().get(sid, {}).get("transcript", "")
+        if row["exiting"](event, data): forget(sid)
+        elif sid in sessions(): remember(sid, agent=agent, open=False, ended=now,
+                                         transcript=tp, state="idle", state_at=now)
         # A flag raised by this session dies with it: Hyprland hands the address straight to
         # the next window, which would otherwise inherit the loud mark.
         needs_write(lambda n: {k: v for k, v in n.items()
                                if not (isinstance(v, dict) and v.get("sid") == sid)})
         prune()
-    elif event == "notification":
-        if str(data.get("notification_type", "")).startswith(NEEDS_TYPES):
-            win = window_for_process()
-            if win:
-                a = norm_addr(win["address"])
-                needs_write(lambda n: {**n, a: {"at": time.time(), "sid": sid}})
-    elif event in ("prompt-submit", "pre-tool"):
-        if not load(NEEDS, {}): return          # cheap exit: fires on every tool call
+    elif internal == "notification":
+        # Codex has no notification_type to read — PermissionRequest is the whole signal —
+        # so each agent decides for itself what its payload means.
+        if not sid or not row["needs"](event, data): return
+        reap(now)
         win = window_for_process()
         if win:
             a = norm_addr(win["address"])
-            needs_write(lambda n: {k: v for k, v in n.items()
-                                   if k != a and not (isinstance(v, dict) and v.get("sid") == sid)})
+            needs_write(lambda n: {**n, a: {"at": now, "sid": sid}})
+    elif internal in ("prompt-submit", "pre-tool", "stop"):
+        mark_state(sid, STATE_OF[internal], now, canon(event) in CONTINUES)
+        # The session moved, so whatever it was waiting for has been answered. Only its own
+        # flags go: another session in the same window may still be waiting on you.
+        if sid and load(NEEDS, {}): clear_needs(sid)   # the read is the cheap exit: fires per tool
 
 # ---------- commands ----------
 def cmd_name(sub, given=""):
@@ -366,9 +734,19 @@ CHILD_ENV = ("CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE
              "CLAUDE_CODE_BRIDGE_SESSION_ID", "CLAUDE_CODE_EXECPATH", "CLAUDE_PID",
              "CLAUDE_EFFORT", "CLAUDECODE", "AI_AGENT")
 
-def launch_claude(cwd, *args):
+def resume_args(row, sid):
+    """How this agent is told to reopen a session, or None for one that cannot be told.
+    None means we open it fresh instead of a terminal that dies on startup."""
+    tpl = row.get("resume") or ()
+    return [p.format(sid=sid) for p in tpl] if tpl and sid else None
+
+def launch_agent(row, cwd, *args):
+    """Open a terminal running one agent. The launch override in agent-workspaces.json is a
+    command line, so it belongs to the default agent only: a Codex session must not be
+    reopened by whatever the user set `claude` to."""
     env = {k: v for k, v in os.environ.items() if k not in CHILD_ENV}
     cmd, home_cwd = launch_command()
+    if row["name"] != DEFAULT_AGENT: cmd = list(row["cmd"])
     cwd = cwd if os.path.isdir(cwd) else home_cwd
     subprocess.Popen(["omarchy-launch-tui", "--app-id=org.omarchy.agent", *cmd, *args],
                      cwd=cwd if os.path.isdir(cwd) else None, start_new_session=True, env=env,
@@ -378,7 +756,7 @@ def workspace_belongings(ws):
     """What a reset of `ws` would take: its name, the session records that belong to it, and
     the windows to close. A window is only ours if a session record points at it — a glyph in
     a title is enough to *show* a session, but not enough to close somebody's window."""
-    live = {norm_addr(c["address"]): c for c in (hypr("clients") or [])}
+    live = {norm_addr(c["address"]): c for c in (clients() or [])}
     here, elsewhere = {}, set()
     for sid, r in sessions().items():
         a = norm_addr(r.get("address", ""))
@@ -435,26 +813,49 @@ def cmd_reset(args):
     notify("Workspace reset", "every workspace" if every else f"workspace {targets[0]}")
 
 def cmd_launch():
+    reap()          # a window closed without a session-end is a session to bring back, not one to leave open
     ws = focused_ws(); name = ws_name(ws)
     closed = [(sid, r) for sid, r in sessions().items()
               if name and r.get("name") == name and not r.get("open")] if name else []
-    # A transcript can vanish between close and resume; drop those rather than
-    # launch a terminal that dies on "No conversation found".
+    # Two things stop a session being resumed: its transcript vanished between close and
+    # now, or its agent has no way to be told to reopen one. Neither is a reason to lose the
+    # workspace — those open fresh where they were working, instead of a terminal that dies
+    # on "No conversation found", or a Codex session opened as `claude --resume <codex id>`.
     gone = {sid for sid, r in closed if not resumable(r.get("transcript", ""))}
-    if gone:
-        update(SESSIONS, lambda s: {k: v for k, v in s.items() if k not in gone})
-        closed = [(sid, r) for sid, r in closed if sid not in gone]
-    if closed:
-        for sid, r in sorted(closed, key=lambda x: x[1].get("ended", 0)):
-            launch_claude(r.get("cwd", ""), "--resume", sid)
-        notify("Resuming sessions", f"{len(closed)} in {name}")
+    resumed = fresh = 0
+    for sid, r in sorted(closed, key=lambda x: x[1].get("ended", 0)):
+        row = AGENT_ROWS.get(r.get("agent") or DEFAULT_AGENT)
+        if row is None: continue     # a record naming an agent this version does not know
+        args = None if sid in gone else resume_args(row, sid)
+        launch_agent(row, r.get("cwd", ""), *(args or ()))
+        if args: resumed += 1
+        else: fresh += 1
+    if gone: update(SESSIONS, lambda s: {k: v for k, v in s.items() if k not in gone})
+    if resumed or fresh:
+        what = [f"{resumed} resumed"] if resumed else []
+        if fresh: what.append(f"{fresh} fresh")
+        notify("Restoring sessions", ", ".join(what) + f" in {name}")
     else:
-        launch_claude("")
+        launch_agent(AGENT_ROWS[DEFAULT_AGENT], "")
+
+def parse_hook_args(args):
+    """`hook EVENT [--agent NAME]`, in either order and with either spelling of the value,
+    because these lines are written into three agents' configs by hand as often as not."""
+    event, agent, i = "", None, 0
+    while i < len(args):
+        t = args[i]
+        if t.startswith("--agent="): agent = t.split("=", 1)[1]
+        elif t == "--agent" and i + 1 < len(args): agent = args[i + 1]; i += 1
+        elif not event and not t.startswith("-"): event = t
+        i += 1
+    return event, (agent or "").strip().lower() or None
 
 def main():
     a = sys.argv[1:]
     if not a: print(__doc__); sys.exit(1)
-    if a[0] == "hook" and len(a) > 1: hook(a[1])
+    if a[0] == "hook" and len(a) > 1:
+        event, agent = parse_hook_args(a[1:])
+        if event: hook(event, agent)
     elif a[0] == "name" and len(a) > 1: cmd_name(a[1], " ".join(a[2:]))
     elif a[0] == "launch": cmd_launch()
     elif a[0] == "reset": cmd_reset(a[1:])
@@ -470,6 +871,7 @@ def main():
         with open(path, "a") as f:
             f.write(time.strftime("%H:%M:%S ") + " ".join(a[1:]) + "\n")
     elif a[0] == "state":
+        reap()          # the dump is for debugging: show what is true now, not what was left behind
         print(json.dumps({"config": config(), "sessions": sessions(), "needs": load(NEEDS, {}),
                           "slugs": load(SLUGS, {})}, indent=2))
     else: print(__doc__); sys.exit(1)
