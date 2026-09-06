@@ -6,8 +6,11 @@ pass=0; fail=0
 check() { if [[ $2 == "$3" ]]; then echo "  ok   $1"; ((pass++)); else echo "  FAIL $1"; echo "       want: $3"; echo "       got:  $2"; ((fail++)); fi; }
 unset XDG_CONFIG_HOME XDG_STATE_HOME XDG_DATA_HOME
 S="$(mktemp -d)"
-fire() {  # fire <event> <agent> <payload>
-  printf '%s' "$3" | HOME="$S" AGENT_WS_NO_AI=1 python3 "$HERE/bin/agent-ws" hook "$1" --agent "$2" --state "$S/state" >/dev/null 2>&1
+rc=0
+fire() {  # fire <event> <agent> <payload>; keeps the exit code, because a hook that dies
+          # takes the state write with it
+  printf '%s' "$3" | HOME="$S" AGENT_WS_NO_AI=1 python3 "$HERE/bin/agent-ws" hook "$1" --agent "$2" --state "$S/state" >"$S/err.txt" 2>&1
+  rc=$?
 }
 field() { python3 -c "import json,sys;print((json.load(open(sys.argv[1])).get(sys.argv[2]) or {}).get(sys.argv[3],''))" "$S/state/sessions.json" "$1" "$2" 2>/dev/null; }
 seed() { mkdir -p "$S/state"; python3 -c "
@@ -50,6 +53,35 @@ seed sid-codex3 codex "$S/empty.jsonl"
 fire UserPromptSubmit codex '{"session_id":"sid-codex3","turn_id":"t1"}'
 check "leaves the slot unnamed rather than inventing one" "$(field sid-codex3 about)" ""
 check "and still marks it working" "$(field sid-codex3 state)" "working"
+
+echo "a transcript record that is not shaped the way any agent writes one"
+cat > "$S/odd.jsonl" <<'JSON'
+{"payload":{"role":"user","content":[{"type":"input_text","text":null}]}}
+{"payload":{"role":"user","content":[{"type":"input_text","text":"rename the odds column"}]}}
+JSON
+seed sid-odd codex "$S/odd.jsonl"
+fire UserPromptSubmit codex '{"session_id":"sid-odd","turn_id":"t1"}'
+check "does not take the state write down with it" "$rc" "0"
+check "and the session is still marked working" "$(field sid-odd state)" "working"
+check "and the next record that does read as a request is the one used" \
+  "$(field sid-odd about)" "rename the odds column"
+
+echo "a payload whose prompt key holds an object rather than a line of text"
+seed sid-obj codex "$S/rollout.jsonl"
+fire UserPromptSubmit codex '{"session_id":"sid-obj","turn_id":"t1","message":{"role":"user","content":[{"text":"hi"}]}}'
+check "is ignored, so no slot is named after a dump of a data structure" \
+  "$(field sid-obj about)" "take a look at the boxes project and see if we can get better results there"
+
+echo "a multi-line prompt"
+seed sid-multi codex ""
+fire UserPromptSubmit codex '{"session_id":"sid-multi","turn_id":"t1","prompt":"first line\n\nsecond line"}'
+check "is kept as one line" "$(field sid-multi about)" "first line second line"
+
+echo "a prompt from a session nothing has ever recorded"
+python3 -c "import json;json.dump({}, open('$S/state/sessions.json','w'))"
+fire UserPromptSubmit codex '{"session_id":"ghost-1","turn_id":"t1","prompt":"fix the odds table"}'
+check "creates no record, because an id we have never seen owns no window" \
+  "$(python3 -c "import json;print(len(json.load(open('$S/state/sessions.json'))))")" "0"
 
 rm -rf "$S"
 echo

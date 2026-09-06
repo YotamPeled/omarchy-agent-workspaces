@@ -391,12 +391,13 @@ def normalize(data, row):
         for k in keys:
             v = data.get(k)
             if v is None or isinstance(v, bool): continue   # Muse sends transcript_path: null
+            if isinstance(v, (dict, list)): continue        # a repr of an object is not a value
             s = str(v).strip()
             if s: return s
         return ""
     return {"sid": first(row["sid"]), "cwd": first(row["cwd"]),
             "transcript": first(row["transcript"]),
-            "prompt": first(row.get("prompt", ()))[:PROMPT_CAP]}
+            "prompt": " ".join(first(row.get("prompt", ())).split())[:PROMPT_CAP]}
 
 def first_prompt(path):
     """The first thing the user actually asked, out of a transcript an agent is writing.
@@ -420,7 +421,7 @@ def first_prompt(path):
         content = body.get("content")
         if isinstance(content, str): text = content
         elif isinstance(content, list):
-            text = " ".join(c.get("text", "") for c in content if isinstance(c, dict))
+            text = " ".join(str(c.get("text") or "") for c in content if isinstance(c, dict))
         else: continue
         text = " ".join(text.split())
         if text and not text.startswith("<"): return text[:PROMPT_CAP]
@@ -433,9 +434,16 @@ def name_from_prompt(sid, row, norm):
     session would rename itself under him all evening. The hook payload is preferred over
     the transcript because it costs nothing to read."""
     if not sid or row.get("titles", True): return
-    if (sessions().get(sid) or {}).get("about"): return
-    about = norm["prompt"] or first_prompt(norm["transcript"]
-                                           or (sessions().get(sid) or {}).get("transcript", ""))
+    rec = sessions().get(sid)
+    # Only a session we already know: an id we have never seen owns no window, so writing a
+    # record for it would file a name against nothing. adopt() refuses the same way.
+    if not rec or rec.get("about"): return
+    # A name is a nicety; the state write behind it is the feature. A transcript we cannot
+    # make sense of leaves the slot unnamed and nothing else.
+    try:
+        about = norm["prompt"] or first_prompt(norm["transcript"] or rec.get("transcript", ""))
+    except Exception:
+        return
     if about: remember(sid, about=about)
 
 def is_helper(data):
