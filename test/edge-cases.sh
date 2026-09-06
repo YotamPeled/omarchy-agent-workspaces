@@ -134,6 +134,38 @@ check "their file comes back exactly as it was" "$(j "$S/.codex/hooks.json")" "$
 check "and it is not deleted from under them" "$(test -e "$S/.codex/hooks.json" && echo yes || echo no)" "yes"
 rm -rf "$S" "$P"
 
+echo "upgrading from the previous release"
+newhome; onlyagents claude
+python3 - "$S" <<'P'
+import json, sys
+s = sys.argv[1]
+old = lambda sub: {"matcher": "*", "hooks": [{"type": "command",
+                   "command": f"agent-ws hook {sub}", "timeout": 10}]}
+json.dump({"model": "opus", "hooks": {e: [old(sub)] for e, sub in (
+    ("SessionStart", "session-start"), ("SessionEnd", "session-end"),
+    ("Notification", "notification"), ("UserPromptSubmit", "prompt-submit"),
+    ("PreToolUse", "pre-tool"))}}, open(f"{s}/.claude/settings.json", "w"), indent=2)
+import os
+d = f"{s}/.local/state/omarchy/agent-workspaces"; os.makedirs(d, exist_ok=True)
+json.dump({"hooks": ["Notification", "PreToolUse", "SessionEnd", "SessionStart",
+                     "UserPromptSubmit"]}, open(f"{d}/install.json", "w"), indent=2)
+P
+runwith install >/dev/null
+check "every line ends up naming its own agent, not just the new one" \
+  "$(python3 -c "
+import json
+h = json.load(open('$S/.claude/settings.json'))['hooks']
+lines = [x['command'] for ev in h.values() for g in ev for x in g['hooks']]
+print(len(lines), sum('--agent claude' in c for c in lines))")" "6 6"
+runwith uninstall >/dev/null
+check "and uninstall still takes every one of them back" \
+  "$(python3 -c "
+import json
+d = json.load(open('$S/.claude/settings.json'))
+lines = [x['command'] for ev in d.get('hooks', {}).values() for g in ev for x in g['hooks']]
+print(len(lines), d.get('model'))")" "0 opus"
+rm -rf "$S" "$P"
+
 echo "a hook of the user's own, written exactly the way we would write it"
 newhome; onlyagents claude
 python3 - "$S" <<'P'
@@ -150,6 +182,26 @@ check "install adds five, not six, because theirs already covers one" \
   "$(grep -c 'Claude Code hooks … added 5' <<<"$out")" "1"
 runwith uninstall >/dev/null
 check "their line survives uninstall" "$(j "$S/.claude/settings.json")" "$before"
+rm -rf "$S" "$P"
+
+echo "a hook of the user's own in the shape our older release used"
+newhome; onlyagents claude
+python3 - "$S" <<'P'
+import json, sys
+theirs = {"matcher": "*", "hooks": [{"type": "command",
+          "command": "agent-ws hook pre-tool", "timeout": 10}]}
+json.dump({"model": "opus", "hooks": {"PreToolUse": [theirs]}},
+          open(f"{sys.argv[1]}/.claude/settings.json", "w"), indent=2)
+P
+before="$(j "$S/.claude/settings.json")"
+runwith install >/dev/null
+check "we do not rewrite it, because no record of ours claims it" \
+  "$(python3 -c "
+import json
+h = json.load(open('$S/.claude/settings.json'))['hooks']['PreToolUse']
+print(any(x['command'] == 'agent-ws hook pre-tool' for g in h for x in g['hooks']))")" "True"
+runwith uninstall >/dev/null
+check "and it is exactly as they left it" "$(j "$S/.claude/settings.json")" "$before"
 rm -rf "$S" "$P"
 
 echo "a machine whose state folder is not the usual one"
