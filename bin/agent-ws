@@ -27,6 +27,8 @@ GLYPHS = "◐◑◒◓✳"
 NEEDS_TYPES = ("permission_prompt", "agent_needs_input", "elicitation")  # idle_prompt is just idle
 NEEDS_TTL = 3600      # Hyprland reuses window addresses, so a flag must not outlive its window
 SLUG_CAP = 2000       # one entry per session title ever seen; bounded so the file cannot grow forever
+PROMPT_CAP = 200      # a prompt is only ever a naming hint, so keep the opening line, not the essay
+ROLLOUT_SCAN = 400000 # bytes of a transcript read looking for the first prompt: it is near the top
 LOG_CAP = 262144
 
 # ---------- agents ----------
@@ -96,7 +98,10 @@ MUSE_VALUED = frozenset((
 #                they swallow the token after them; anything else is a switch
 #   subcommands  headless subcommands; a token that is one of these is a subcommand
 #                unless it sits where a flag's value goes (see headless())
-#   sid/cwd/transcript   payload keys, the ones seen on the wire first
+#   sid/cwd/transcript/prompt   payload keys, the ones seen on the wire first
+#   titles       True when the agent writes what it is working on into its window title,
+#                which the bar reads for free. Codex writes only its working directory, so
+#                its slot would be named after a folder; for those we keep the first prompt
 #   cmd          how to start this agent fresh
 #   resume       argv that reopens one of its sessions, () for an agent that cannot;
 #                taken from each binary's own --help, not from a doc:
@@ -111,6 +116,7 @@ AGENTS = (
      "sid": ("session_id",),
      "cwd": ("cwd",),
      "transcript": ("transcript_path",),
+     "prompt": ("prompt",), "titles": True,
      "cmd": ("claude",), "resume": ("--resume", "{sid}"),
      "needs": needs_by_type, "exiting": exit_by_reason},
     # Codex. `-p` here is --profile and is windowed (`codex --help`); the headless runs
@@ -124,6 +130,7 @@ AGENTS = (
      "sid": ("session_id", "conversation_id", "conversationId", "sessionId"),
      "cwd": ("cwd", "working_directory", "workdir"),
      "transcript": ("transcript_path", "rollout_path"),
+     "prompt": ("prompt", "message", "user_prompt"), "titles": False,
      "cmd": ("codex",), "resume": ("resume", "{sid}"),
      "needs": needs_by_event, "exiting": never_exits},
     # Muse Code: a wrapper script named `muse` that execs `muse-bin-<version>`, which is
@@ -140,6 +147,7 @@ AGENTS = (
      "sid": ("session_id",),
      "cwd": ("cwd",),
      "transcript": ("transcript_path",),
+     "prompt": ("prompt",), "titles": True,
      "cmd": ("muse",), "resume": ("resume", "{sid}"),
      "needs": needs_by_event, "exiting": never_exits},
 )
@@ -387,7 +395,48 @@ def normalize(data, row):
             if s: return s
         return ""
     return {"sid": first(row["sid"]), "cwd": first(row["cwd"]),
-            "transcript": first(row["transcript"])}
+            "transcript": first(row["transcript"]),
+            "prompt": first(row.get("prompt", ()))[:PROMPT_CAP]}
+
+def first_prompt(path):
+    """The first thing the user actually asked, out of a transcript an agent is writing.
+
+    For the agents that do not put their prompt in their window title, this is the only
+    thing that can name their workspace after the work instead of after a folder. The
+    prompt sits within the first few records, so only the head of the file is read - a
+    live transcript runs to tens of megabytes. A record wrapped in angle brackets is the
+    harness telling the model where it is, not the user speaking, and is skipped."""
+    if not path: return ""
+    try:
+        with open(path, "rb") as fh: head = fh.read(ROLLOUT_SCAN)
+    except OSError:
+        return ""
+    for line in head.split(b"\n"):
+        try: rec = json.loads(line)
+        except Exception: continue
+        if not isinstance(rec, dict): continue
+        body = rec.get("payload") if isinstance(rec.get("payload"), dict) else rec
+        if body.get("role") != "user": continue
+        content = body.get("content")
+        if isinstance(content, str): text = content
+        elif isinstance(content, list):
+            text = " ".join(c.get("text", "") for c in content if isinstance(c, dict))
+        else: continue
+        text = " ".join(text.split())
+        if text and not text.startswith("<"): return text[:PROMPT_CAP]
+    return ""
+
+def name_from_prompt(sid, row, norm):
+    """Keep what a session was asked to do, for an agent whose window title cannot say.
+
+    Only the first prompt is kept: a workspace named after the tenth question of a long
+    session would rename itself under him all evening. The hook payload is preferred over
+    the transcript because it costs nothing to read."""
+    if not sid or row.get("titles", True): return
+    if (sessions().get(sid) or {}).get("about"): return
+    about = norm["prompt"] or first_prompt(norm["transcript"]
+                                           or (sessions().get(sid) or {}).get("transcript", ""))
+    if about: remember(sid, about=about)
 
 def is_helper(data):
     """A helper Muse runs inside a session fires the same events, under an id of its own.
@@ -530,7 +579,8 @@ def ai_slug(title):
     except OSError: pass
     open(mark, "w").close()
     prompt = (
-        "This is the title of a coding session running in one workspace of my desktop. "
+        "This is the title of a coding session running in one workspace of my desktop, "
+        "or, for an agent that titles nothing, the first thing it was asked to do. "
         "Name that workspace so I can tell at a glance which session it is.\n\n"
         "Rules:\n"
         "- At most 13 characters. Lowercase. Letters, digits and hyphens only.\n"
@@ -773,6 +823,7 @@ def hook(event, agent=None):
         # one, which knew of no agents, so it would show no mark until it was restarted.
         # Every line names its agent on every event, so the first one fills the gap in.
         adopt(sid, agent)
+        if internal == "prompt-submit": name_from_prompt(sid, row, norm)
         mark_state(sid, STATE_OF[internal], now, canon(event) in CONTINUES)
         # The session moved, so whatever it was waiting for has been answered. Only its own
         # flags go: another session in the same window may still be waiting on you.

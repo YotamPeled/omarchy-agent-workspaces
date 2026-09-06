@@ -29,10 +29,10 @@ BarWidget {
   // Claude spins one of these into its terminal title and parks on the last one when idle.
   readonly property string workingGlyphs: "◐◑◒◓"
   readonly property string idleGlyph: "✳"
-  // Muse spins a braille mark into its title the same way, but writes nothing when idle,
-  // so a title tells us Muse is working and the record below is what tells us it stopped.
-  readonly property string museGlyphs: "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
-  // Codex never touches its title at all, so a Codex slot exists only because of the record.
+  // Muse and Codex both spin a braille mark into their titles the same way, but write
+  // nothing when idle, so a title tells us one of them is working and the record below is
+  // what tells us it stopped. The mark is shared, so it never says which of the two it is.
+  readonly property string brailleGlyphs: "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
   readonly property var agentMarks: ({ "claude": "C", "codex": "X", "muse": "M" })
   readonly property real cellWidth: Style.space(24)
   readonly property real tailPad: Style.space(10)
@@ -187,14 +187,19 @@ BarWidget {
       if (rec && !root.ownsWindow(rec, ipc)) rec = null
       var g = title.length ? title.charAt(0) : ""      // indexOf("") is 0: an untitled window would match
       var claudeGlyph = title.length > 0 && (root.workingGlyphs.indexOf(g) !== -1 || g === root.idleGlyph)
-      var museGlyph = title.length > 0 && root.museGlyphs.indexOf(g) !== -1
-      if (!claudeGlyph && !museGlyph && !rec) continue
+      var brailleGlyph = title.length > 0 && root.brailleGlyphs.indexOf(g) !== -1
+      if (!claudeGlyph && !brailleGlyph && !rec) continue
       var working = claudeGlyph ? root.workingGlyphs.indexOf(g) !== -1
-                  : (museGlyph ? true : rec.state === "working")
+                  : (brailleGlyph ? true : rec.state === "working")
       var flagged = t.urgent === true
       if (!flagged) for (var k in root.needs) if (root.normAddr(k) === addr) { flagged = true; break }
-      var full = (claudeGlyph || museGlyph) ? title.slice(1).trim() : title
-      var agent = rec ? String(rec.agent || "") : (claudeGlyph ? "claude" : "muse")
+      // Codex titles its window with the folder it was started in, never with the work, so
+      // its hook keeps the first thing it was asked. That is the better name where it exists.
+      var about = rec ? String(rec.about || "") : ""
+      var full = about || ((claudeGlyph || brailleGlyph) ? title.slice(1).trim() : title)
+      // Only Claude's glyphs name their agent; the braille mark is shared by Muse and
+      // Codex, so with no record to say which, the slot shows a state and no letter.
+      var agent = rec ? String(rec.agent || "") : (claudeGlyph ? "claude" : "")
       out.push({ title: full, addr: addr, focused: !!t.activated, agent: agent,
                  state: flagged ? "needs" : (working ? "working" : "idle"),
                  last: root.lastActive[addr] || 0 })
