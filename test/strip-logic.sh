@@ -17,7 +17,7 @@ python3 - "$HERE/Workspaces.qml" >> "$T/run.js" <<'PY'
 import re, sys
 s = open(sys.argv[1]).read()
 out = []
-for n in ("recorded", "sessionsIn", "worst", "lead", "agentMark"):
+for n in ("recorded", "ownsWindow", "sessionsIn", "worst", "lead", "agentMark"):
     a = s.index(f"  function {n}(")
     nxt = len(s)
     for m in re.finditer(r"\n  (function |// |readonly |property |Timer|implicitWidth)", s[a+10:]):

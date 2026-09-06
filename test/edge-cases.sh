@@ -134,6 +134,50 @@ check "their file comes back exactly as it was" "$(j "$S/.codex/hooks.json")" "$
 check "and it is not deleted from under them" "$(test -e "$S/.codex/hooks.json" && echo yes || echo no)" "yes"
 rm -rf "$S" "$P"
 
+echo "a hook of the user's own, written exactly the way we would write it"
+newhome; onlyagents claude
+python3 - "$S" <<'P'
+import json, sys
+s = sys.argv[1]
+theirs = {"matcher": "*", "hooks": [{"type": "command",
+          "command": "agent-ws hook session-start --agent claude", "timeout": 10}]}
+json.dump({"model": "opus", "hooks": {"SessionStart": [theirs]}},
+          open(f"{s}/.claude/settings.json", "w"), indent=2)
+P
+before="$(j "$S/.claude/settings.json")"
+out="$(runwith install)"
+check "install adds five, not six, because theirs already covers one" \
+  "$(grep -c 'Claude Code hooks … added 5' <<<"$out")" "1"
+runwith uninstall >/dev/null
+check "their line survives uninstall" "$(j "$S/.claude/settings.json")" "$before"
+rm -rf "$S" "$P"
+
+echo "a machine whose state folder is not the usual one"
+newhome; onlyagents claude codex muse
+mkdir -p "$S/.state"
+HOME="$S" XDG_STATE_HOME="$S/.state" PATH="$P:/usr/bin:/bin" AGENT_WS_NO_RELOAD=1 "$HERE/install" >/dev/null 2>&1
+check "every hook line carries the folder, so a hook stripped of its environment still finds it" \
+  "$(python3 -c "
+import json
+n = 0
+for f in ('$S/.claude/settings.json', '$S/.codex/hooks.json'):
+    for ev in json.load(open(f))['hooks'].values():
+        for g in ev:
+            for h in g['hooks']:
+                if '--state $S/.state/omarchy/agent-workspaces' in h['command']: n += 1
+print(n)")" "12"
+check "and so does the copy of the plugin it installs" \
+  "$(python3 -c "
+import json
+hs = json.load(open('$S/.state/omarchy/agent-workspaces/muse-plugin/.muse-plugin/plugin.json'))['capabilities']['hooks']
+print(len(hs), all(h['command'][-2:] == ['--state', '$S/.state/omarchy/agent-workspaces'] for h in hs))")" "6 True"
+check "the download itself is left alone" \
+  "$(python3 -c "
+import json
+hs = json.load(open('$HERE/muse-plugin/.muse-plugin/plugin.json'))['capabilities']['hooks']
+print(any('--state' in h['command'] for h in hs))")" "False"
+rm -rf "$S" "$P"
+
 echo "someone else's agent-ws already on the PATH"
 newhome; echo "#!/bin/sh" > "$S/.local/bin/agent-ws"; chmod +x "$S/.local/bin/agent-ws"
 run install >/dev/null; run uninstall >/dev/null

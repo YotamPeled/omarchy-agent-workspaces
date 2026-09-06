@@ -154,9 +154,21 @@ BarWidget {
       var r = root.sess[id]
       if (!r || typeof r !== "object" || r.open !== true) continue
       var a = root.normAddr(r.address)
-      if (a) by[a] = r
+      if (!a) continue
+      // Later beats earlier when two sessions claim one window, so the slot shows the one
+      // that moved most recently rather than whichever happened to be read first.
+      var was = by[a]
+      if (!was || Number(r.state_at || 0) >= Number(was.state_at || 0)) by[a] = r
     }
     return by
+  }
+  // Hyprland hands a closed window's address straight to the next one, so a record left
+  // open by a session that died would otherwise turn a stranger's window into a slot — and
+  // reset would then close it. The process is what tells them apart; a record from an older
+  // version carries none, and those are still trusted on the address alone.
+  function ownsWindow(rec, ipc) {
+    var mine = Number(rec.pid || 0), theirs = Number((ipc && ipc.pid) || 0)
+    return !mine || !theirs || mine === theirs
   }
 
   // Sessions in a workspace. Two sources, in this order: the mark an agent spins into its
@@ -172,6 +184,7 @@ BarWidget {
       var ipc = t.lastIpcObject || {}
       var addr = root.normAddr(t.address !== undefined ? t.address : ipc.address)
       var rec = by[addr] || null
+      if (rec && !root.ownsWindow(rec, ipc)) rec = null
       var g = title.length ? title.charAt(0) : ""      // indexOf("") is 0: an untitled window would match
       var claudeGlyph = title.length > 0 && (root.workingGlyphs.indexOf(g) !== -1 || g === root.idleGlyph)
       var museGlyph = title.length > 0 && root.museGlyphs.indexOf(g) !== -1

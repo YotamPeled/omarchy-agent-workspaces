@@ -48,9 +48,14 @@ def needs_by_type(event, data):
     return str(data.get("notification_type", "")).startswith(NEEDS_TYPES)
 
 def needs_by_event(event, data):
-    """Codex has no Notification event at all: PermissionRequest is the whole signal, and
-    it carries no notification_type, so the event name is all there is to read."""
-    return canon(event) == "permissionrequest"
+    """Codex and Muse have no Notification event at all: PermissionRequest is the whole
+    signal, and it carries no notification_type, so the name is all there is to read.
+
+    Both spellings count. The line the installer writes carries our own short name for the
+    event; a hand-wired line carries the agent's. They mean the same thing, and nothing
+    else reaches this branch for either agent, so reading only one of them meant the flag
+    was never raised for a session that was in fact waiting on the user."""
+    return canon(event) in ("permissionrequest", "notification")
 
 
 def exit_by_reason(event, data):
@@ -63,10 +68,32 @@ def never_exits(event, data):
     Keeping the session is the safe way to be wrong — it stays resumable."""
     return False
 
+# Straight from each binary's own --help, 2026-09-06: every flag it documents as taking a
+# value. Everything else is a switch and does not swallow the token behind it.
+CLAUDE_VALUED = frozenset((
+    "--add-dir", "--agent", "--agents", "--allowed-tools", "--append-system-prompt",
+    "--autocompact", "--betas", "--debug-file", "--disallowed-tools", "--effort",
+    "--environment", "--fallback-model", "--file", "--input-format", "--json-schema",
+    "--max-budget-usd", "--mcp-config", "--model", "-n", "--name", "--output-format",
+    "--permission-mode", "--permission-prompts", "--plugin-dir", "--plugin-url",
+    "--remote-control-session-name-prefix", "--resume", "--session-id", "--settings",
+    "--setting-sources", "--system-prompt", "--system-prompt-snapshot", "--tools"))
+CODEX_VALUED = frozenset((
+    "-a", "--add-dir", "--ask-for-approval", "-c", "-C", "--cd", "--config", "--disable",
+    "--enable", "-i", "--image", "--local-provider", "-m", "--model", "-p", "--profile",
+    "--remote", "--remote-auth-token-env", "-s", "--sandbox"))
+MUSE_VALUED = frozenset((
+    "--agents", "--approval-judge", "--approval-mode", "--base-url", "--echo-delay-ms",
+    "--image", "--model", "--permission-profile", "--preset", "--provider",
+    "--reasoning-effort", "--sandbox-network", "--workspace", "--worktree-base",
+    "--worktree-existing"))
+
 # One row per supported agent.
 #   procs        whole process basenames; a trailing * is the only prefix allowed, so
 #                `museum` and `codex-notify.sh` are not agents
 #   flags        headless switches, matched anywhere in argv (they are order-free)
+#   valued       the flags this binary's own --help shows taking a value, so they and only
+#                they swallow the token after them; anything else is a switch
 #   subcommands  headless subcommands; a token that is one of these is a subcommand
 #                unless it sits where a flag's value goes (see headless())
 #   sid/cwd/transcript   payload keys, the ones seen on the wire first
@@ -80,6 +107,7 @@ AGENTS = (
      "procs": ("claude", "claude-code"),
      "flags": ("-p", "--print"),           # `claude -p` fires hooks but owns no window
      "subcommands": (),
+     "valued": CLAUDE_VALUED,
      "sid": ("session_id",),
      "cwd": ("cwd",),
      "transcript": ("transcript_path",),
@@ -92,6 +120,7 @@ AGENTS = (
      "procs": ("codex",),
      "flags": (),
      "subcommands": ("exec", "e", "review"),
+     "valued": CODEX_VALUED,
      "sid": ("session_id", "conversation_id", "conversationId", "sessionId"),
      "cwd": ("cwd", "working_directory", "workdir"),
      "transcript": ("transcript_path", "rollout_path"),
@@ -107,6 +136,7 @@ AGENTS = (
      "procs": ("muse", "muse-bin-*"),
      "flags": (),
      "subcommands": ("exec",),
+     "valued": MUSE_VALUED,
      "sid": ("session_id",),
      "cwd": ("cwd",),
      "transcript": ("transcript_path",),
@@ -387,7 +417,7 @@ def headless(row, args, i):
     for a in args[i + 1:]:
         if a == "--": after_flag = False; continue          # everything after is positional
         if len(a) > 1 and a.startswith("-"):
-            after_flag = "=" not in a
+            after_flag = "=" not in a and a in row["valued"]
             continue
         if not after_flag and a in row["subcommands"]: return True
         after_flag = False
@@ -540,6 +570,18 @@ def resumable(transcript):
     try: return bool(transcript) and os.path.getsize(transcript) > 0
     except OSError: return False
 
+def reopenable(rec):
+    """Can this closed session be told to reopen? Claude is asked by its transcript, which
+    has to still be on disk. The other two are asked by their session id alone, and Muse
+    sends no transcript at all — measured, its payloads carry transcript_path: null — so
+    testing every agent for a transcript threw every Muse session away the moment its
+    window closed, and a named workspace could never bring one back."""
+    row = AGENT_ROWS.get(rec.get("agent") or DEFAULT_AGENT)
+    if row is None or not row.get("resume"): return False
+    if "{transcript}" in " ".join(row["resume"]) or row["name"] == "claude":
+        return resumable(rec.get("transcript", ""))
+    return True
+
 def remember(sid, **fields):
     def f(s):
         rec = s.get(sid, {}); rec.update(fields); s[sid] = rec; return s
@@ -551,10 +593,10 @@ def forget(sid):
 KEEP_DAYS = 30
 
 def keepable(rec):
-    """Keep anything still resumable. A transcript on disk is the whole test: the workspace
-    may be unnamed now and named later, and then Super+Shift+A should still find it."""
+    """Keep anything its own agent could still reopen: the workspace may be unnamed now and
+    named later, and then Super+Shift+A should still find it."""
     if rec.get("open"): return True
-    if not resumable(rec.get("transcript", "")): return False
+    if not reopenable(rec): return False
     return time.time() - rec.get("ended", 0) < KEEP_DAYS * 86400
 
 def prune():
@@ -607,21 +649,30 @@ def adopt_open_sessions(ws, name):
     update(SESSIONS, f)
 
 # ---------- hooks ----------
+HEARTBEAT = 5     # how often a session already in this state bothers to say so again
+
 def mark_state(sid, state, at, continuing=False):
     """Working or idle on a session we already know, at the moment the event reached us.
 
-    Four things are refused, in the same lock as every other write:
-      · the state already on record — that is most tool calls, and it writes nothing;
-      · an event older than the state on record, because two hooks racing for this lock
-        are handled in whichever order they get it, not the order they fired;
+    Refused, in the same lock as every other write:
+      · an event older than what is on record, because two hooks racing for this lock are
+        handled in whichever order they get it, not the order they fired;
       · a continuation — a tool or a subagent finishing — waking an idle session;
-      · working on a session whose window has closed."""
+      · working on a session whose window has closed.
+
+    An event that only repeats the state already on record is a heartbeat, not a no-op: it
+    moves the timestamp forward, at most every few seconds so the hot path still writes
+    almost nothing. Without that the timestamp stayed at the moment work began, so a
+    session working for longer than the hour the reaper allows was called idle while it was
+    still firing tools, and a stop that fired before the newest prompt could still land."""
     if not sid or not state: return
     def f(s):
         rec = s.get(sid)
-        if rec is None or rec.get("state") == state: return None
+        if rec is None: return None
         if at <= rec.get("state_at", 0): return None
-        if state == "working" and (continuing or not rec.get("open")): return None
+        same = rec.get("state") == state
+        if not same and state == "working" and (continuing or not rec.get("open")): return None
+        if same and at - rec.get("state_at", 0) < HEARTBEAT: return None
         rec["state"] = state; rec["state_at"] = at
         return s
     update(SESSIONS, f)
@@ -858,7 +909,7 @@ def cmd_launch():
     # now, or its agent has no way to be told to reopen one. Neither is a reason to lose the
     # workspace — those open fresh where they were working, instead of a terminal that dies
     # on "No conversation found", or a Codex session opened as `claude --resume <codex id>`.
-    gone = {sid for sid, r in closed if not resumable(r.get("transcript", ""))}
+    gone = {sid for sid, r in closed if not reopenable(r)}
     resumed = fresh = 0
     for sid, r in sorted(closed, key=lambda x: x[1].get("ended", 0)):
         row = AGENT_ROWS.get(r.get("agent") or DEFAULT_AGENT)
@@ -876,22 +927,37 @@ def cmd_launch():
         launch_agent(AGENT_ROWS[DEFAULT_AGENT], "")
 
 def parse_hook_args(args):
-    """`hook EVENT [--agent NAME]`, in either order and with either spelling of the value,
-    because these lines are written into three agents' configs by hand as often as not."""
-    event, agent, i = "", None, 0
+    """`hook EVENT [--agent NAME] [--state DIR]`, in any order and with either spelling of
+    a value, because these lines are written into three agents' configs by hand as often as
+    not."""
+    event, agent, state, i = "", None, None, 0
     while i < len(args):
         t = args[i]
         if t.startswith("--agent="): agent = t.split("=", 1)[1]
         elif t == "--agent" and i + 1 < len(args): agent = args[i + 1]; i += 1
+        elif t.startswith("--state="): state = t.split("=", 1)[1]
+        elif t == "--state" and i + 1 < len(args): state = args[i + 1]; i += 1
         elif not event and not t.startswith("-"): event = t
         i += 1
-    return event, (agent or "").strip().lower() or None
+    return event, (agent or "").strip().lower() or None, (state or "").strip() or None
+
+def use_state(path):
+    """Point every state file at another folder.
+
+    Muse hands its hooks almost no environment, XDG_STATE_HOME among the things it drops,
+    so a hook would write to the default folder while a bar told to use another one read
+    somewhere else and saw nothing. The installer resolves the folder once and writes it
+    into the line, which is the only place that knows both sides."""
+    global STATE, SESSIONS, NEEDS, SLUGS
+    STATE = path
+    SESSIONS, NEEDS, SLUGS = (f"{STATE}/{n}.json" for n in ("sessions", "needs", "slugs"))
 
 def main():
     a = sys.argv[1:]
     if not a: print(__doc__); sys.exit(1)
     if a[0] == "hook" and len(a) > 1:
-        event, agent = parse_hook_args(a[1:])
+        event, agent, state = parse_hook_args(a[1:])
+        if state: use_state(state)
         if event: hook(event, agent)
     elif a[0] == "name" and len(a) > 1: cmd_name(a[1], " ".join(a[2:]))
     elif a[0] == "launch": cmd_launch()

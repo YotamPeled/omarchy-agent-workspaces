@@ -19,7 +19,15 @@ BINDINGS = f"{HOME}/.config/hypr/bindings.lua"
 AUTOSTART = f"{HOME}/.config/hypr/autostart.lua"
 BEGIN, END = "-- >>> agent-workspaces", "-- <<< agent-workspaces"
 NOTE = "-- Managed by Agent Workspaces. Edits inside this block are lost on reinstall."
-STATE = f"{HOME}/.local/state/omarchy/agent-workspaces"
+def state_home():
+    """XDG_STATE_HOME is honoured only when it sits inside HOME, for the same reason the
+    config folder is: a sandbox that redirects HOME alone must not reach the real machine."""
+    x = os.environ.get("XDG_STATE_HOME", "")
+    inside = x and os.path.commonpath([os.path.abspath(x), HOME]) == HOME
+    return os.path.abspath(x) if inside else f"{HOME}/.local/state"
+
+STATE = state_home() + "/omarchy/agent-workspaces"
+DEFAULT_STATE = f"{HOME}/.local/state/omarchy/agent-workspaces"
 RECORD = f"{STATE}/install.json"          # what we changed, so uninstall can undo just that
 HOOK_TIMEOUT = 10
 
@@ -136,6 +144,12 @@ def unblock(path):
 
 
 # ---------- the pieces ----------
+def state_flag():
+    """Only written when this machine's state folder is not the one the reporter assumes.
+    Muse drops that setting from a hook's environment, so the line is the only place that
+    can carry it."""
+    return [] if STATE == DEFAULT_STATE else ["--state", STATE]
+
 def our_entry(sub, agent=None, matcher=True):
     """One hook entry, exactly as we write it. The --agent flag is what makes the reporter
     sure who fired: the line lives in that agent's own file, so it can simply say.
@@ -143,7 +157,8 @@ def our_entry(sub, agent=None, matcher=True):
     Only Claude gets a matcher. Muse silently runs no hook at all from a group that has
     one — measured, by watching a live Muse window fire nothing from a file identical
     except for that key — and Codex uses a matcher to name tools, not to mean "any"."""
-    cmd = f"agent-ws hook {sub}" + (f" --agent {agent}" if agent else "")
+    cmd = " ".join(["agent-ws", "hook", sub]
+                   + ([f"--agent", agent] if agent else []) + state_flag())
     entry = {"hooks": [{"type": "command", "command": cmd, "timeout": HOOK_TIMEOUT}]}
     return {"matcher": "*", **entry} if matcher else entry
 
@@ -191,13 +206,18 @@ def hooks_install_one(cfg):
 
 def hooks_remove_one(cfg):
     """Take out exactly the entries install put in, in any shape we have ever written.
-    A hook of the user's own that calls agent-ws is theirs, not ours, and stays."""
+    A hook of the user's own that calls agent-ws is theirs, not ours, and stays — including
+    one that happens to be written exactly as we would write it. Install skipped that event
+    rather than adding a second copy, so it was never recorded as ours, and only what was
+    recorded is taken back."""
     doc = read_json(cfg["path"], {})
     if not isinstance(doc, dict): return "nothing to remove"
     hooks = doc.get("hooks", {})
     if not isinstance(hooks, dict): return "nothing to remove"
+    mine_events = set(recorded(f"hooks_{cfg['name']}", []))
     removed = 0
     for event, sub in cfg["events"].items():
+        if event not in mine_events: continue
         entries = hooks.get(event)
         if not isinstance(entries, list): continue
         mine = ours(sub, cfg["name"], cfg["matcher"])
@@ -207,7 +227,10 @@ def hooks_remove_one(cfg):
         else: hooks.pop(event)
     if removed:
         if not hooks: doc.pop("hooks", None)
-        if recorded(f"made_{cfg['name']}") and not doc:
+        # `settings_made` is what versions before three-agent support recorded for Claude;
+        # without it an upgrade then an uninstall left behind an empty file we had created.
+        made = recorded(f"made_{cfg['name']}") or (cfg["name"] == "claude" and recorded("settings_made"))
+        if made and not doc:
             remove_file(cfg["path"])
             # the folder too, if we are the ones who made it and nothing else moved in
             with contextlib.suppress(OSError): os.rmdir(os.path.dirname(cfg["path"]))
@@ -231,11 +254,22 @@ def muse_install(src):
     if not shutil.which("muse"): return "not installed, skipped"
     bundle = f"{src}/muse-plugin"
     if not os.path.isdir(bundle): return "the plugin is missing from this download"
+    if state_flag():
+        # A shipped manifest cannot know this machine's state folder, so it is written in
+        # on a copy; the download itself is never edited.
+        bundle = f"{STATE}/muse-plugin"
+        shutil.rmtree(bundle, ignore_errors=True)
+        shutil.copytree(f"{src}/muse-plugin", bundle)
+        man = f"{bundle}/.muse-plugin/plugin.json"
+        d = read_json(man, {})
+        for h in d.get("capabilities", {}).get("hooks", []):
+            h["command"] = list(h.get("command", [])) + state_flag()
+        write_json(man, d)
     r = muse("install", bundle, "--scope", "user")
     if r.returncode != 0: return f"muse refused it: {r.stderr.strip().splitlines()[-1:] or ''}"
+    record(muse_plugin=True)      # recorded before approving, so a half-done install is still ours to remove
     a = muse("approve", MUSE_PLUGIN)
     if a.returncode != 0: return f"installed, but muse would not approve it: {a.stderr.strip()}"
-    record(muse_plugin=True)
     return "installed and approved"
 
 def muse_remove():

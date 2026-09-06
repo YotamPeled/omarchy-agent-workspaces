@@ -59,5 +59,22 @@ check("an untitled window is not mistaken for a session",
 check("a window whose title merely starts with a letter is not one either",
   only(root.sessionsIn(ws(win("Cargo.toml — helix", "ii")))), []);
 
+// what the review round caught
+root.sess = { s1: { address: "jj", agent: "codex", state: "working", open: true, pid: 4242 } };
+check("a record left open by a session that died does not claim the window that reused its address",
+  only(root.sessionsIn(ws(win("someone else", "jj", { lastIpcObject: { pid: 9999 } })))), []);
+check("and it does claim its own window",
+  only(root.sessionsIn(ws(win("codex", "jj", { lastIpcObject: { pid: 4242 } })))), [["codex", "working"]]);
+root.sess = { s1: { address: "jj", agent: "codex", state: "working", open: true } };
+check("a record from an older version, which carries no process, is still trusted on the address",
+  only(root.sessionsIn(ws(win("codex", "jj", { lastIpcObject: { pid: 9999 } })))), [["codex", "working"]]);
+
+root.sess = {
+  older: { address: "kk", agent: "codex", state: "idle", open: true, state_at: 100 },
+  newer: { address: "kk", agent: "muse", state: "working", open: true, state_at: 200 },
+};
+check("two sessions in one window: the slot shows the one that moved most recently",
+  only(root.sessionsIn(ws(win("shared", "kk")))), [["muse", "working"]]);
+
 console.log(fail ? `\n${fail} failed, ${pass} passed` : `\nall ${pass} checks passed`);
 process.exit(fail ? 1 : 0);
