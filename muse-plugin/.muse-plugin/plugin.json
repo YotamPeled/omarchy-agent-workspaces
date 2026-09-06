@@ -1,0 +1,91 @@
+{
+  "schemaVersion": 1,
+  "name": "agent-workspaces",
+  "displayName": "Agent Workspaces",
+  "version": "1.0.0",
+  "description": "Tells the Omarchy workspace strip which workspace this session is in and what it is doing.",
+  "compat": {
+    "source": "native",
+    "manifestDir": ".muse-plugin"
+  },
+  "capabilities": {
+    "skills": [],
+    "commands": [],
+    "hooks": [
+      {
+        "id": "sessionstart",
+        "event": "SessionStart",
+        "command": [
+          "agent-ws",
+          "hook",
+          "session-start",
+          "--agent",
+          "muse"
+        ],
+        "timeoutMs": 10000
+      },
+      {
+        "id": "sessionend",
+        "event": "SessionEnd",
+        "command": [
+          "agent-ws",
+          "hook",
+          "session-end",
+          "--agent",
+          "muse"
+        ],
+        "timeoutMs": 10000
+      },
+      {
+        "id": "userpromptsubmit",
+        "event": "UserPromptSubmit",
+        "command": [
+          "agent-ws",
+          "hook",
+          "prompt-submit",
+          "--agent",
+          "muse"
+        ],
+        "timeoutMs": 10000
+      },
+      {
+        "id": "pretooluse",
+        "event": "PreToolUse",
+        "command": [
+          "agent-ws",
+          "hook",
+          "pre-tool",
+          "--agent",
+          "muse"
+        ],
+        "timeoutMs": 10000
+      },
+      {
+        "id": "permissionrequest",
+        "event": "PermissionRequest",
+        "command": [
+          "agent-ws",
+          "hook",
+          "notification",
+          "--agent",
+          "muse"
+        ],
+        "timeoutMs": 10000
+      },
+      {
+        "id": "stop",
+        "event": "Stop",
+        "command": [
+          "agent-ws",
+          "hook",
+          "stop",
+          "--agent",
+          "muse"
+        ],
+        "timeoutMs": 10000
+      }
+    ],
+    "mcpServers": [],
+    "reminders": []
+  }
+}
