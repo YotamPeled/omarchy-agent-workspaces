@@ -60,18 +60,20 @@ otherwise, which is what covers an agent that has gone quiet.
 
 A session names its own workspace. The name comes from the title the agent gives the chat:
 first a name derived on the spot, then a better one from Haiku about seven seconds later,
-cached so a title costs one call ever. Codex titles its window with the folder it was started
-in rather than the work, so for Codex the name comes from the request the session opened with —
-read once, from the session's own transcript, so the slot does not rename itself all evening.
+cached so a title costs one call ever. Codex and Muse both title their windows with the folder
+they were started in rather than the work, so for those two the name comes from the request the
+session opened with — read once, from the session's own transcript, so the slot does not rename
+itself all evening. Muse tells its hooks it has no transcript, so we go and find the log it keeps
+for itself, under its own data folder, by session id.
 
 - `Localsend not finding iPhone on omarchy` → `localsend-ios`
 - `Build story engine compose.py with beat vocabulary` → `compose-beats`
 - `Skip permissions dangerously` → `perms-danger`
 
 The better name costs one `claude -p` call per distinct title, whichever agent the session
-belongs to. **The window title is sent to the Anthropic API** — or, for Codex, the opening line
-of your first request. Nothing else: not the rest of the transcript, not your working
-directory, not the session id. An agent renames a chat as it
+belongs to. **The window title is sent to the Anthropic API** — or, for Codex and Muse, the
+opening line of your first request. Nothing else: not the rest of the transcript, not your
+working directory, not the session id. An agent renames a chat as it
 goes, so a long session may cost a few calls over its life, one per new title. Set
 `AGENT_WS_NO_AI=1` to turn this off and keep the plain derived names, which need no network
 at all.

@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.yotampeled.agent-workspaces",
   "name": "Agent Workspaces",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "author": "Yotam Peled",
   "description": "Workspace strip that shows what each Claude Code, Codex and Muse Code session is doing",
   "kinds": ["bar-widget"],
