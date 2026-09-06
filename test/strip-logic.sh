@@ -7,7 +7,7 @@ command -v node >/dev/null || { echo "SKIP: node is not installed"; exit 0; }
 T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
 cat > "$T/run.js" <<'JS'
 const root = {
-  workingGlyphs: "◐◑◒◓", idleGlyph: "✳", museGlyphs: "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏",
+  workingGlyphs: "◐◑◒◓", idleGlyph: "✳", brailleGlyphs: "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏",
   agentMarks: { claude: "C", codex: "X", muse: "M" },
   sess: {}, needs: {}, lastActive: {},
   normAddr(a) { return String(a || "").replace(/^0x/i, "").toLowerCase() },

@@ -53,7 +53,19 @@ check("a record written by an older version, with no agent and no state, still k
 check("and shows no letter rather than a wrong one",
   root.agentMark(root.sessionsIn(ws(win("foot", "gg")))), "");
 
+root.sess = { s1: Object.assign(rec("mm", "codex", "working"), { about: "port the odds table to the new feed" }) };
+check("a Codex slot is named after what it was asked, not the folder it was started in",
+  root.sessionsIn(ws(win("\u280f yotam", "mm")))[0].title, "port the odds table to the new feed");
+root.sess = { s1: rec("mm", "claude", "working") };
+check("an agent that titles its own window still names the slot from that title",
+  root.sessionsIn(ws(win("\u25d1 keyboard scrolling", "mm")))[0].title, "keyboard scrolling");
+
 root.sess = {};
+check("a braille mark with no record shows working, because Muse and Codex share that mark",
+  only(root.sessionsIn(ws(win("\u2807 work", "jj")))), [["", "working"]]);
+check("and shows no letter, because the mark cannot say which of the two it is",
+  root.agentMark(root.sessionsIn(ws(win("\u2807 work", "jj")))), "");
+
 check("an untitled window is not mistaken for a session",
   only(root.sessionsIn(ws(win("", "hh")))), []);
 check("a window whose title merely starts with a letter is not one either",

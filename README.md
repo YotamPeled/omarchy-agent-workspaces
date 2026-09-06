@@ -52,23 +52,26 @@ Two of the three need a word about how they are wired:
   through Muse's own `muse plugins install --scope user`, and approves it in the same step.
   Uninstall removes it.
 
-Working and idle are free where an agent already says so in its terminal title — Claude and
-Muse both do, with different marks — and come from the hooks otherwise, which is the only
-thing that makes a Codex window visible at all.
+Working and idle are free where an agent already says so in its terminal title — all three do,
+Claude with one mark and Muse and Codex with a second one they share — and come from the hooks
+otherwise, which is what covers an agent that has gone quiet.
 
 ## Names
 
 A session names its own workspace. The name comes from the title the agent gives the chat:
 first a name derived on the spot, then a better one from Haiku about seven seconds later,
-cached so a title costs one call ever.
+cached so a title costs one call ever. Codex titles its window with the folder it was started
+in rather than the work, so for Codex the name comes from the first thing you asked it — read
+once, from the session's own transcript, so the slot does not rename itself all evening.
 
 - `Localsend not finding iPhone on omarchy` → `localsend-ios`
 - `Build story engine compose.py with beat vocabulary` → `compose-beats`
 - `Skip permissions dangerously` → `perms-danger`
 
 The better name costs one `claude -p` call per distinct title, whichever agent the session
-belongs to. **The window title is sent to the Anthropic API** — nothing else: not the
-transcript, not your working directory, not the session id. An agent renames a chat as it
+belongs to. **The window title is sent to the Anthropic API** — or, for Codex, the opening line
+of your first request. Nothing else: not the rest of the transcript, not your working
+directory, not the session id. An agent renames a chat as it
 goes, so a long session may cost a few calls over its life, one per new title. Set
 `AGENT_WS_NO_AI=1` to turn this off and keep the plain derived names, which need no network
 at all.
@@ -180,7 +183,8 @@ because the titles are ones Hyprland is holding anyway — which is why Claude's
 instant and costs nothing, and why Muse's working mark is too. The flip side: any window whose
 title happens to start with one of those marks is *shown* as a session. It will not be closed
 by a reset — that needs a real session record — but it will occupy a slot until you retitle it.
-Codex marks nothing, so a Codex slot exists only because of the record its hooks wrote.
+Muse and Codex share one mark, so a title alone never says which of the two is running; the
+letter in the slot comes from the record its hooks wrote, or is left off.
 
 ## Requirements
 
