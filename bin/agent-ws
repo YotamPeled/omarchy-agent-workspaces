@@ -649,6 +649,16 @@ def adopt_open_sessions(ws, name):
     update(SESSIONS, f)
 
 # ---------- hooks ----------
+def adopt(sid, agent):
+    """Name the agent of a session recorded before this version, and only then."""
+    if not sid or not agent: return
+    def f(s):
+        rec = s.get(sid)
+        if rec is None or rec.get("agent"): return None
+        rec["agent"] = agent
+        return s
+    update(SESSIONS, f)
+
 HEARTBEAT = 5     # how often a session already in this state bothers to say so again
 
 def mark_state(sid, state, at, continuing=False):
@@ -759,6 +769,10 @@ def hook(event, agent=None):
             a = norm_addr(win["address"])
             needs_write(lambda n: {**n, a: {"at": now, "sid": sid}})
     elif internal in ("prompt-submit", "pre-tool", "stop"):
+        # A session already running when this version was installed was recorded by the old
+        # one, which knew of no agents, so it would show no mark until it was restarted.
+        # Every line names its agent on every event, so the first one fills the gap in.
+        adopt(sid, agent)
         mark_state(sid, STATE_OF[internal], now, canon(event) in CONTINUES)
         # The session moved, so whatever it was waiting for has been answered. Only its own
         # flags go: another session in the same window may still be waiting on you.
