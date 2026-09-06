@@ -5,9 +5,11 @@ import Quickshell.Hyprland
 import qs.Commons
 import qs.Ui
 
-// Agent workspaces: each slot is a fixed index cell (the workspace number) plus a
-// name tail when the workspace holds a Claude Code session. Session name and state come
-// from the terminal title Claude sets ("<glyph> <title>"); "needs you" from a hook flag.
+// Agent workspaces: each slot is a fixed index cell (the workspace number) plus a name
+// tail when the workspace holds a coding-agent session, and a small letter saying which of
+// the three agents it is. State comes from the mark an agent spins into its terminal title
+// where there is one, and otherwise from the record its hooks write; "needs you" is always
+// a hook flag.
 // Design: UI expert spec 2026-09-05. Colours are the bar's theme tokens only.
 BarWidget {
   id: root
@@ -22,9 +24,16 @@ BarWidget {
   property var local: ({})      // title -> heuristic label, from `agent-ws slug`
   property var lastActive: ({}) // window address -> ms of last title/focus change
   property var asked: ({})      // titles already sent to agent-ws slug
+  property var sess: ({})       // sessions.json: session id -> {agent, workspace, state, address, open}
 
+  // Claude spins one of these into its terminal title and parks on the last one when idle.
   readonly property string workingGlyphs: "◐◑◒◓"
   readonly property string idleGlyph: "✳"
+  // Muse spins a braille mark into its title the same way, but writes nothing when idle,
+  // so a title tells us Muse is working and the record below is what tells us it stopped.
+  readonly property string museGlyphs: "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+  // Codex never touches its title at all, so a Codex slot exists only because of the record.
+  readonly property var agentMarks: ({ "claude": "C", "codex": "X", "muse": "M" })
   readonly property real cellWidth: Style.space(24)
   readonly property real tailPad: Style.space(10)
   // Budget from the screen, never from the bar: the bar's width depends on ours (binding loop).
@@ -50,6 +59,13 @@ BarWidget {
     watchChanges: true; printErrors: false
     onLoaded: root.needs = root.parse(text())
     onLoadFailed: root.needs = ({})
+    onFileChanged: reload()
+  }
+  FileView {
+    path: root.stateDir + "/sessions.json"
+    watchChanges: true; printErrors: false
+    onLoaded: root.sess = root.parse(text())
+    onLoadFailed: root.sess = ({})
     onFileChanged: reload()
   }
   FileView {
@@ -129,23 +145,44 @@ BarWidget {
   }
   function manualName(id) { var e = entry(id); return e && e.name ? String(e.name).slice(0, 14) : "" }
 
-  // Sessions in a workspace: Claude windows, recognised by the status glyph in their title.
+  // Every session recorded by a hook, indexed by the window it owns. This is the only way
+  // a Codex window is seen at all, and the only way an idle Muse one is: neither writes a
+  // mark we could read off a title.
+  function recorded() {
+    var by = ({})
+    for (var id in root.sess) {
+      var r = root.sess[id]
+      if (!r || typeof r !== "object" || r.open !== true) continue
+      var a = root.normAddr(r.address)
+      if (a) by[a] = r
+    }
+    return by
+  }
+
+  // Sessions in a workspace. Two sources, in this order: the mark an agent spins into its
+  // own title, which is instant and costs nothing, and the record its hooks wrote, which is
+  // what covers the agents that mark nothing.
   function sessionsIn(ws) {
     var out = []
     if (!ws) return out
+    var by = root.recorded()
     var tls = ws.toplevels.values
     for (var i = 0; i < tls.length; i++) {
       var t = tls[i]; var title = String(t.title || "")
-      if (title.length === 0) continue      // indexOf("") is 0: an untitled window would match
-      var g = title.charAt(0)
-      var working = root.workingGlyphs.indexOf(g) !== -1
-      if (!working && g !== root.idleGlyph) continue
       var ipc = t.lastIpcObject || {}
       var addr = root.normAddr(t.address !== undefined ? t.address : ipc.address)
+      var rec = by[addr] || null
+      var g = title.length ? title.charAt(0) : ""      // indexOf("") is 0: an untitled window would match
+      var claudeGlyph = title.length > 0 && (root.workingGlyphs.indexOf(g) !== -1 || g === root.idleGlyph)
+      var museGlyph = title.length > 0 && root.museGlyphs.indexOf(g) !== -1
+      if (!claudeGlyph && !museGlyph && !rec) continue
+      var working = claudeGlyph ? root.workingGlyphs.indexOf(g) !== -1
+                  : (museGlyph ? true : rec.state === "working")
       var flagged = t.urgent === true
       if (!flagged) for (var k in root.needs) if (root.normAddr(k) === addr) { flagged = true; break }
-      var full = title.slice(1).trim()
-      out.push({ title: full, addr: addr, focused: !!t.activated,
+      var full = (claudeGlyph || museGlyph) ? title.slice(1).trim() : title
+      var agent = rec ? String(rec.agent || "") : (claudeGlyph ? "claude" : "muse")
+      out.push({ title: full, addr: addr, focused: !!t.activated, agent: agent,
                  state: flagged ? "needs" : (working ? "working" : "idle"),
                  last: root.lastActive[addr] || 0 })
     }
@@ -199,6 +236,10 @@ BarWidget {
   Timer { interval: 2000; repeat: true; running: true; onTriggered: root.scanTitles() }
 
   function stateWord(s) { return s === "needs" ? "needs you" : s }
+  function agentMark(sessions) {
+    var l = root.lead(sessions)
+    return l && root.agentMarks[l.agent] !== undefined ? root.agentMarks[l.agent] : ""
+  }
 
   // ---------- width ladder ----------
   // The Row reports what it wants at the current level; if that overruns the budget we step
@@ -262,6 +303,7 @@ BarWidget {
         readonly property bool occupied: workspace !== null && workspace.toplevels.values.length > 0
         readonly property string name: root.shown(root.fullNameFor(modelData, sessions), root.level, wsState, focused)
         readonly property bool loud: wsState === "needs"
+        readonly property string mark: root.agentMark(sessions)
 
         width: root.cellWidth + (nameText.visible ? nameText.implicitWidth + root.tailPad : 0)
         height: root.barSize
@@ -281,6 +323,17 @@ BarWidget {
             color: slot.loud ? root.loud : root.fg
             opacity: slot.occupied || slot.focused ? 1 : 0.5
             Behavior on color { enabled: root.animate; ColorAnimation { duration: 160 } }
+            Behavior on opacity { enabled: root.animate; NumberAnimation { duration: 160 } }
+          }
+          Text {        // which agent is in this slot
+            id: markText
+            anchors.top: parent.top; anchors.right: parent.right
+            anchors.topMargin: Style.space(3); anchors.rightMargin: Style.space(2)
+            text: slot.mark
+            font.family: root.bar ? root.bar.fontFamily : Style.font.family
+            font.pixelSize: Math.round(Style.font.body * 0.62)
+            color: slot.loud ? root.loud : root.fg
+            opacity: slot.mark ? 0.7 : 0
             Behavior on opacity { enabled: root.animate; NumberAnimation { duration: 160 } }
           }
           Rectangle {   // working / idle
