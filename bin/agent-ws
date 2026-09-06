@@ -17,7 +17,7 @@
 Config  ~/.config/omarchy/workspace-names.json   {"2": "rss-digest"}   workspace id -> its name
 State   ~/.local/state/omarchy/agent-workspaces/  sessions.json · needs.json · slugs.json
 """
-import contextlib, fcntl, json, os, re, subprocess, sys, time, hashlib
+import contextlib, fcntl, glob, json, os, re, subprocess, sys, time, hashlib
 
 HOME = os.path.expanduser("~")
 CONFIG = f"{HOME}/.config/omarchy/workspace-names.json"
@@ -138,7 +138,10 @@ AGENTS = (
     # captured from a live Muse window, not from the binary: cwd, session_id, turn_id,
     # hook_event_name, model, permission_mode, and transcript_path, which is always null.
     # Its needs-you is PermissionRequest, the same as Codex: Muse fires no notification
-    # event at all and sends no notification_type, so there is nothing else to read.
+    # event at all and sends no notification_type, so there is nothing else to read. Its
+    # window title is the working directory, like Codex's, so it is named from its prompt
+    # too - and since it hands the hook no transcript at all, we go and find the one it is
+    # writing.
     {"name": "muse",
      "procs": ("muse", "muse-bin-*"),
      "flags": (),
@@ -147,7 +150,7 @@ AGENTS = (
      "sid": ("session_id",),
      "cwd": ("cwd",),
      "transcript": ("transcript_path",),
-     "prompt": ("prompt",), "titles": True,
+     "prompt": ("prompt",), "titles": False, "find_transcript": lambda sid: muse_transcript(sid),
      "cmd": ("muse",), "resume": ("resume", "{sid}"),
      "needs": needs_by_event, "exiting": never_exits},
 )
@@ -399,6 +402,18 @@ def normalize(data, row):
             "transcript": first(row["transcript"]),
             "prompt": " ".join(first(row.get("prompt", ())).split())[:PROMPT_CAP]}
 
+def muse_transcript(sid):
+    """The transcript Muse is writing but does not mention.
+
+    Every Muse hook says its transcript is nothing at all, so the only way to read what a
+    session was asked is to go and find the log it keeps for itself: under its own data
+    folder, in a tree by date, in a directory named for the session. Three levels of small
+    directories, looked at once per session and never again."""
+    if not sid: return ""
+    root = os.environ.get("XDG_DATA_HOME", f"{HOME}/.local/share") + "/muse/sessions"
+    hits = glob.glob(f"{root}/*/*/*/{glob.escape(sid)}/session.jsonl")
+    return hits[0] if hits else ""
+
 def first_prompt(path):
     """The first thing the user actually asked, out of a transcript an agent is writing.
 
@@ -417,8 +432,13 @@ def first_prompt(path):
         except Exception: continue
         if not isinstance(rec, dict): continue
         body = rec.get("payload") if isinstance(rec.get("payload"), dict) else rec
-        if body.get("role") != "user": continue
-        content = body.get("content")
+        # Muse files a request under a type of its own rather than as a message with a
+        # speaker, so the two shapes are read side by side.
+        if rec.get("payload_type") == "runtime.user_intent.accepted":
+            content = body.get("refill_blocks")
+        elif body.get("role") == "user":
+            content = body.get("content")
+        else: continue
         if isinstance(content, str): text = content
         elif isinstance(content, list):
             text = " ".join(str(c.get("text") or "") for c in content if isinstance(c, dict))
@@ -443,7 +463,9 @@ def name_from_prompt(sid, row, norm):
     # A name is a nicety; the state write behind it is the feature. A transcript we cannot
     # make sense of leaves the slot unnamed and nothing else.
     try:
-        about = first_prompt(norm["transcript"] or rec.get("transcript", "")) or norm["prompt"]
+        where = norm["transcript"] or rec.get("transcript", "") or row.get(
+            "find_transcript", lambda _sid: "")(sid)
+        about = first_prompt(where) or norm["prompt"]
     except Exception:
         return
     if about: remember(sid, about=about)

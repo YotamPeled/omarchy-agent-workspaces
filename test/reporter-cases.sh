@@ -9,7 +9,8 @@ S="$(mktemp -d)"
 rc=0
 fire() {  # fire <event> <agent> <payload>; keeps the exit code, because a hook that dies
           # takes the state write with it
-  printf '%s' "$3" | HOME="$S" AGENT_WS_NO_AI=1 python3 "$HERE/bin/agent-ws" hook "$1" --agent "$2" --state "$S/state" >"$S/err.txt" 2>&1
+  printf '%s' "$3" | HOME="$S" XDG_DATA_HOME="$S/share" AGENT_WS_NO_AI=1 \
+    python3 "$HERE/bin/agent-ws" hook "$1" --agent "$2" --state "$S/state" >"$S/err.txt" 2>&1
   rc=$?
 }
 field() { python3 -c "import json,sys;print((json.load(open(sys.argv[1])).get(sys.argv[2]) or {}).get(sys.argv[3],''))" "$S/state/sessions.json" "$1" "$2" 2>/dev/null; }
@@ -88,6 +89,27 @@ python3 -c "import json;json.dump({}, open('$S/state/sessions.json','w'))"
 fire UserPromptSubmit codex '{"session_id":"ghost-1","turn_id":"t1","prompt":"fix the odds table"}'
 check "creates no record, because an id we have never seen owns no window" \
   "$(python3 -c "import json;print(len(json.load(open('$S/state/sessions.json'))))")" "0"
+
+echo "an agent that hands its hook no transcript at all"
+# Muse says its transcript is nothing on every event, but keeps a log of its own, in a tree
+# by date, in a directory named for the session.
+M="$S/share/muse/sessions/2026/09/07/sid-muse"; mkdir -p "$M"
+cat > "$M/session.jsonl" <<'JSON'
+{"payload_type":"session.name.changed","payload":{"new_name":"pine-antares"}}
+{"payload_type":"runtime.user_intent.accepted","payload":{"refill_blocks":[{"kind":"text","text":"give me a million dollar startup idea"}]}}
+JSON
+seed sid-muse muse ""
+fire UserPromptSubmit muse '{"session_id":"sid-muse","turn_id":"t1","transcript_path":null,"cwd":"/home/yotam"}'
+check "is named from the log it keeps for itself, found by session id" \
+  "$(field sid-muse about)" "give me a million dollar startup idea"
+check "and not from the codename it gives itself, which says nothing about the work" \
+  "$(test "$(field sid-muse about)" = "pine-antares" && echo codename || echo request)" "request"
+
+echo "the same agent, before it has written anything down"
+seed sid-muse2 muse ""
+fire UserPromptSubmit muse '{"session_id":"sid-muse2","turn_id":"t1","transcript_path":null}'
+check "leaves the slot unnamed" "$(field sid-muse2 about)" ""
+check "and still marks it working" "$(field sid-muse2 state)" "working"
 
 rm -rf "$S"
 echo
