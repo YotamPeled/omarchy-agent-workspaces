@@ -145,10 +145,6 @@ json.dump({"model": "opus", "hooks": {e: [old(sub)] for e, sub in (
     ("SessionStart", "session-start"), ("SessionEnd", "session-end"),
     ("Notification", "notification"), ("UserPromptSubmit", "prompt-submit"),
     ("PreToolUse", "pre-tool"))}}, open(f"{s}/.claude/settings.json", "w"), indent=2)
-import os
-d = f"{s}/.local/state/omarchy/agent-workspaces"; os.makedirs(d, exist_ok=True)
-json.dump({"hooks": ["Notification", "PreToolUse", "SessionEnd", "SessionStart",
-                     "UserPromptSubmit"]}, open(f"{d}/install.json", "w"), indent=2)
 P
 runwith install >/dev/null
 check "every line ends up naming its own agent, not just the new one" \
@@ -184,22 +180,23 @@ runwith uninstall >/dev/null
 check "their line survives uninstall" "$(j "$S/.claude/settings.json")" "$before"
 rm -rf "$S" "$P"
 
-echo "a hook of the user's own in the shape our older release used"
+echo "a hook of the user's own that calls agent-ws with their own arguments"
 newhome; onlyagents claude
 python3 - "$S" <<'P'
 import json, sys
 theirs = {"matcher": "*", "hooks": [{"type": "command",
-          "command": "agent-ws hook pre-tool", "timeout": 10}]}
+          "command": "bash ~/mine.sh && agent-ws hook pre-tool", "timeout": 30}]}
 json.dump({"model": "opus", "hooks": {"PreToolUse": [theirs]}},
           open(f"{sys.argv[1]}/.claude/settings.json", "w"), indent=2)
 P
 before="$(j "$S/.claude/settings.json")"
 runwith install >/dev/null
-check "we do not rewrite it, because no record of ours claims it" \
+check "we leave it alone and add ours beside it" \
   "$(python3 -c "
 import json
 h = json.load(open('$S/.claude/settings.json'))['hooks']['PreToolUse']
-print(any(x['command'] == 'agent-ws hook pre-tool' for g in h for x in g['hooks']))")" "True"
+c = [x['command'] for g in h for x in g['hooks']]
+print(len(c), any(x.startswith('bash ~/mine.sh') for x in c))")" "2 True"
 runwith uninstall >/dev/null
 check "and it is exactly as they left it" "$(j "$S/.claude/settings.json")" "$before"
 rm -rf "$S" "$P"

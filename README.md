@@ -139,7 +139,10 @@ omarchy plugin remove io.github.yotampeled.agent-workspaces
 ```
 
 Uninstall takes back what install added and only that. It matches its own hook entries
-exactly, so a hook of your own that also calls `agent-ws` survives. It writes Omarchy's
+exactly, so a hook of your own that also calls `agent-ws` survives — one with your arguments,
+your timeout or your own wrapper around it. The one exception is a line byte-identical to what
+an older version of this installer wrote, which we cannot tell from our own: installing
+replaces it with the current line, and uninstalling takes that back. It writes Omarchy's
 workspace strip back into the exact slot it took, in whichever bar section that was — and if
 install had nothing to replace, uninstall removes our widget rather than inventing one. Files
 install created on a bare machine are deleted again rather than left as empty husks. If one
