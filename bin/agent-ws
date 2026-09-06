@@ -430,9 +430,11 @@ def first_prompt(path):
 def name_from_prompt(sid, row, norm):
     """Keep what a session was asked to do, for an agent whose window title cannot say.
 
-    Only the first prompt is kept: a workspace named after the tenth question of a long
-    session would rename itself under him all evening. The hook payload is preferred over
-    the transcript because it costs nothing to read."""
+    The transcript comes first, because it holds the request the session opened with and
+    the payload holds whatever was asked just now - naming a workspace after the tenth
+    question of a long evening says nothing about what the workspace is for. The payload is
+    the fallback, for the first prompt of a new session, which the hook sees before the
+    transcript does. Either way only one prompt is ever kept."""
     if not sid or row.get("titles", True): return
     rec = sessions().get(sid)
     # Only a session we already know: an id we have never seen owns no window, so writing a
@@ -441,7 +443,7 @@ def name_from_prompt(sid, row, norm):
     # A name is a nicety; the state write behind it is the feature. A transcript we cannot
     # make sense of leaves the slot unnamed and nothing else.
     try:
-        about = norm["prompt"] or first_prompt(norm["transcript"] or rec.get("transcript", ""))
+        about = first_prompt(norm["transcript"] or rec.get("transcript", "")) or norm["prompt"]
     except Exception:
         return
     if about: remember(sid, about=about)
