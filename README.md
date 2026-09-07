@@ -32,18 +32,25 @@ changes with it.
 
 A dot dimming is no use on a workspace you are not looking at, so the same moment also plays
 a short sound and raises an Omarchy notification saying which workspace finished and what it
-was doing. It fires only when the slot actually changes — another session still working in
-that workspace leaves the dot bright — and never for a workspace already on your screen.
+was doing.
+
+It fires only when the slot actually changes. Anything else still working in that workspace
+leaves the dot bright and nothing is said — including a window that was open before the plugin
+was installed, which the bar counts by its title alone. A workspace in front of you on any
+monitor has already shown you, and stays silent. A window you moved is announced against the
+workspace it is on now.
 
 Both parts are on by default and are turned off, or pointed at a sound of your own, in
-`~/.config/omarchy/agent-workspaces.json`:
+`~/.config/omarchy/agent-workspaces.json` — a file the plugin reads and never writes:
 
 ```json
 { "finish_sound": "/usr/share/sounds/freedesktop/stereo/complete.oga", "finish_toast": true }
 ```
 
-`false` for either switches it off. The sound is played by whichever of `pw-play`, `paplay` or
-`canberra-gtk-play` is installed; a machine with none of them still gets the notification.
+`false` for either switches it off, quoted or not. A `finish_sound` that is not a file we can
+play falls back to the default rather than reaching a player. The sound goes to whichever of
+`pw-play`, `paplay` or `canberra-gtk-play` is installed; a machine with none of them still gets
+the notification.
 
 ## Three agents
 

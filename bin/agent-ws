@@ -183,9 +183,8 @@ EVENTS = {
     "notification":  ("notification",  (C, M)),   # Codex has no notification event
     "prompt-submit": ("prompt-submit", (C,)),     # our own short name: Claude only
     "pre-tool":      ("pre-tool",      (C,)),     # our own short name: Claude only
-    # install wires no stop hook at all — the five above are the whole set it writes.
-    # This dashed spelling is here for a stop hook someone wires by hand; the codex
-    # binary carries `stop` as well as `Stop`.
+    # Our own short names, for a line someone writes by hand; the codex binary carries
+    # `stop` as well as `Stop`. What install writes is the PascalCase set below.
     "stop":          ("stop",          (C, X, M)),
     # the shared PascalCase vocabulary
     "SessionStart":      ("session-start", (X, M, C)),
@@ -243,10 +242,17 @@ def load(path, default, strict=False):
         with open(path) as f: text = f.read()
     except OSError: return default
     if not text.strip(): return default      # nothing written yet: not a corrupt file
-    try: return json.loads(text)
+    try: value = json.loads(text)
     except ValueError:
         if strict: raise Corrupt(path)
         return default
+    # Right syntax, wrong shape is as unusable as no syntax at all: every caller here indexes
+    # what it gets, so a list where an object belongs used to reach the caller and raise out
+    # of a hook. strict still refuses to let anyone write over it.
+    if not isinstance(value, type(default)):
+        if strict: raise Corrupt(path)
+        return default
+    return value
 
 def save(path, data, sort=True):
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -302,9 +308,11 @@ def hypr_env():
     _HYPR_ENV = env
     return env
 
+HYPR_TIMEOUT = 2   # a wedged compositor must not hold a hook open inside the agent's turn
+
 def hypr(*args):
     out = subprocess.run(["hyprctl", "-j", *args], capture_output=True, text=True,
-                         env=hypr_env()).stdout
+                         timeout=HYPR_TIMEOUT, env=hypr_env()).stdout
     return json.loads(out) if out.strip() else None
 
 def dispatch(lua):
@@ -315,7 +323,7 @@ def clients():
     a truncated answer). Never [] for "we do not know": every "is this window still there"
     below turns on that difference, and one failed call must not retire every session."""
     try: out = hypr("clients")
-    except (OSError, ValueError): return None
+    except (OSError, ValueError, subprocess.SubprocessError): return None
     return out if isinstance(out, list) else None
 
 def cmdline(pid):
@@ -759,9 +767,11 @@ def mark_state(sid, state, at, continuing=False):
     session working for longer than the hour the reaper allows was called idle while it was
     still firing tools, and a stop that fired before the newest prompt could still land.
 
-    Returns the state it moved away from, or None when nothing moved, so the caller can tell
-    a session that has just finished from one that was idle already and said so again."""
-    if not sid or not state: return
+    Returns (the state it moved away from, whether that left nothing else working in the same
+    workspace), or (None, False) when nothing moved. Both are read inside the lock the write
+    took: two sessions in one workspace stopping at once must not both see a quiet workspace
+    and both announce it."""
+    if not sid or not state: return None, False
     def f(s):
         rec = s.get(sid)
         if rec is None: return None
@@ -769,12 +779,16 @@ def mark_state(sid, state, at, continuing=False):
         same = rec.get("state") == state
         if not same and state == "working" and (continuing or not rec.get("open")): return None
         if same and at - rec.get("state_at", 0) < HEARTBEAT: return None
-        if not same: was.append(rec.get("state"))
+        moved = rec.get("state") if not same else None
         rec["state"] = state; rec["state_at"] = at
+        if not same:
+            ws = rec.get("workspace")
+            out.append((moved, not any(o != sid and r.get("open") and r.get("state") == "working"
+                                       and r.get("workspace") == ws for o, r in s.items())))
         return s
-    was = []
+    out = []
     update(SESSIONS, f)
-    return was[0] if was else None
+    return out[0] if out else (None, False)
 
 def clear_needs(sid):
     """Drop the needs-you flags this session raised, and only those. Clearing by window
@@ -787,10 +801,14 @@ def clear_needs(sid):
 # ---------- a session finishing ----------
 # The bar dims a dot the moment a workspace stops working, which is no use when you are on
 # another workspace. So the same moment also gets a sound and a toast, the way herdr does
-# it: only when the dot actually dims, and only when you are not already looking at it.
+# it: only when the dot actually dims, and only when the workspace is not already in front
+# of you.
 DONE_SOUND = "/usr/share/sounds/freedesktop/stereo/complete.oga"
 DONE_GLYPH = "\U000f012c"   # nf-md-check, the glyph Omarchy's own toasts take
 ABOUT_ON_TOAST = 90
+BRAILLE = "\u280b\u2819\u2839\u2838\u283c\u2834\u2826\u2827\u2807\u280f"  # the mark Codex and Muse share
+WORKING_MARKS = "\u25d0\u25d1\u25d2\u25d3" + BRAILLE   # a title starting with one keeps the dot bright
+FALSEY = ("false", "no", "off", "0", "")
 # Every one of these takes the file last and needs nothing but XDG_RUNTIME_DIR to find the
 # audio server, which hypr_env() has already recovered for a hook that was handed none.
 # First one installed wins; a machine with none plays nothing and still gets the toast.
@@ -799,65 +817,100 @@ PLAYERS = (["pw-play", "--volume", "0.35"], ["paplay", "--volume", "22000"],
 
 def prefs(): return load(PREFS, {})
 
+def off(v):
+    """Is this switch off? The file is hand-edited JSON, so "false" in quotes is what someone
+    who meant false wrote, and a truthy string must not silently turn the switch back on."""
+    return v.strip().lower() in FALSEY if isinstance(v, str) else not v
+
 def spawn(argv):
     """Fire and forget. A hook runs inside the agent's turn, so it must not wait on a
-    notification daemon or an audio server, and must not fail when neither is there."""
+    notification daemon or an audio server, and must not fail when neither is there.
+    ValueError as well as OSError: a NUL byte anywhere in the argv is not a missing program
+    but it is the same nothing-to-do, and it can arrive inside a transcript."""
     try:
         subprocess.Popen(argv, env=hypr_env(), stdin=subprocess.DEVNULL,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                          start_new_session=True)
         return True
-    except OSError:
+    except (OSError, ValueError):
         return False
+
+def sound_file(p):
+    """The file to play, or "" for silence. A configured path that is not a file we can hand
+    a player — gone, a directory, or a word like "--help" that a player would read as an
+    option — falls back to ours rather than reaching the command line."""
+    v = p.get("finish_sound", True)
+    if off(v): return ""
+    if isinstance(v, str): return v if os.path.isfile(v) else DONE_SOUND
+    return DONE_SOUND
 
 def play(sound):
     for player in PLAYERS:
         if spawn([*player, sound]): return
 
-def about_line(rec):
-    """What the session is doing, in the words the slot already uses: the opening request we
-    kept for Codex and Muse, and for Claude the window title it writes for itself, less the
-    spinner it parks on."""
-    about = rec.get("about") or ""
-    if not about and rec.get("address"):
-        for c in clients() or []:
-            if norm_addr(c.get("address")) == rec["address"]:
-                about = str(c.get("title") or "").lstrip(GLYPHS + " ")
-                break
-    return " ".join(str(about).split())[:ABOUT_ON_TOAST]
+def one_line(text):
+    """One line of plain text for a notification. Control characters go (a NUL is not even a
+    legal argument), and so does a leading dash: omarchy-notification-send splits --flag=value
+    off its own argument, so a workspace named like an option would take over the toast."""
+    text = "".join(c if c.isprintable() else " " for c in str(text))
+    return " ".join(text.split()).lstrip("-").strip()
 
-def announce(rec, ws):
+def about_line(rec, win):
+    """What it was doing, in the words the slot already shows: the opening request we kept for
+    Codex and Muse, and for Claude the title it writes for itself. Both marks are stripped —
+    Codex and Muse share one, so a session of theirs that recorded no request would otherwise
+    be announced with a spinner in front of it."""
+    about = rec.get("about") or str(win.get("title") or "").lstrip(GLYPHS + BRAILLE + " ")
+    return one_line(about)[:ABOUT_ON_TOAST]
+
+def visible_ws():
+    """Every workspace in front of you, one per monitor — not just the focused one, because a
+    workspace on your second screen has already shown you it finished. None if we could not
+    ask, which is not the same as "none of them"."""
+    try: ms = hypr("monitors")
+    except (OSError, ValueError, subprocess.SubprocessError): return None
+    if not isinstance(ms, list): return None
+    return {m.get("activeWorkspace", {}).get("id") for m in ms if isinstance(m, dict)}
+
+def announce(rec, ws, win):
     p = prefs()
-    label = rec.get("name") or ws_name(ws) or f"Workspace {ws}"
-    if p.get("finish_toast", True):
-        # The headline always carries the name inside a longer sentence, so a workspace named
-        # after something that looks like an option is still one word of text, never a flag.
-        spawn(["omarchy-notification-send", "--app-name", "Agent Workspaces",
-               "-g", DONE_GLYPH, f"{label} finished",
-               about_line(rec) or f"{(rec.get('agent') or 'the agent').capitalize()} stopped working"])
-    sound = p.get("finish_sound", True)
-    if sound: play(sound if isinstance(sound, str) else DONE_SOUND)
+    if not off(p.get("finish_toast", True)):
+        spawn(["omarchy-notification-send", "--app-name", "Agent Workspaces", "-g", DONE_GLYPH,
+               f"{one_line(rec.get('name') or ws_name(ws)) or f'Workspace {ws}'} finished",
+               about_line(rec, win)
+               or f"{(rec.get('agent') or 'the agent').capitalize()} stopped working"])
+    sound = sound_file(p)
+    if sound: play(sound)
 
 def finished(sid):
-    """A session stopped working. Announce it only when the slot on the bar actually changes:
-    another session still working in that workspace leaves the dot bright, and a workspace
-    already on screen has just told you itself.
+    """A session stopped working and nothing else on record in its workspace still is. Say so
+    — unless the bar is not going to change either.
 
-    If Hyprland cannot be asked which workspace you are on, say nothing. Being wrong the
-    other way is a sound fired at a window you are looking at."""
+    Hyprland is the authority on the rest, because the widget draws from the same live answer
+    and not from what we filed at session start. The workspace is the one the window is on
+    now, so a window you moved is announced against the slot it is actually in. A window that
+    has gone took its slot with it: that is not a dot dimming. And another title in the
+    workspace still carrying a working mark keeps the dot bright with no record to say so,
+    which is what an agent already open when the plugin was installed looks like.
+
+    If Hyprland cannot be asked, say nothing. Being wrong the other way is a sound fired at a
+    window you are looking at."""
     p = prefs()
-    if not (p.get("finish_toast", True) or p.get("finish_sound", True)): return
-    all_ = sessions()
-    rec = all_.get(sid)
+    if off(p.get("finish_toast", True)) and not sound_file(p): return
+    rec = sessions().get(sid)
     if not rec: return
-    ws = rec.get("workspace")
-    for other, r in all_.items():
-        if other != sid and r.get("workspace") == ws and r.get("open") \
-           and r.get("state") == "working": return
-    try:
-        if focused_ws() == ws: return
-    except (OSError, ValueError, TypeError, KeyError): return
-    announce(rec, ws)
+    cs = clients()
+    if cs is None: return
+    mine = next((c for c in cs if norm_addr(c.get("address")) == rec.get("address")), None)
+    if mine is None: return
+    ws = (mine.get("workspace") or {}).get("id")
+    for c in cs:
+        if c is mine or (c.get("workspace") or {}).get("id") != ws: continue
+        t = str(c.get("title") or "")          # "" is in every string: an untitled window
+        if t and t[0] in WORKING_MARKS: return  # must not count as a working one
+    seen = visible_ws()
+    if seen is None or ws in seen: return
+    announce(rec, ws, mine)
 
 
 def hook(event, agent=None):
@@ -939,10 +992,10 @@ def hook(event, agent=None):
         # Every line names its agent on every event, so the first one fills the gap in.
         adopt(sid, agent)
         if internal == "prompt-submit": name_from_prompt(sid, row, norm)
-        was = mark_state(sid, STATE_OF[internal], now, canon(event) in CONTINUES)
+        was, alone = mark_state(sid, STATE_OF[internal], now, canon(event) in CONTINUES)
         # Only a real stop announces. The reaper also calls a stale session idle, an hour
         # after it went quiet, which is a guess about a session nobody is waiting on.
-        if internal == "stop" and was == "working": finished(sid)
+        if internal == "stop" and was == "working" and alone: finished(sid)
         # The session moved, so whatever it was waiting for has been answered. Only its own
         # flags go: another session in the same window may still be waiting on you.
         if sid and load(NEEDS, {}): clear_needs(sid)   # the read is the cheap exit: fires per tool
