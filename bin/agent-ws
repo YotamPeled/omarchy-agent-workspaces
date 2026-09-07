@@ -21,6 +21,7 @@ import contextlib, fcntl, glob, json, os, re, subprocess, sys, time, hashlib
 
 HOME = os.path.expanduser("~")
 CONFIG = f"{HOME}/.config/omarchy/workspace-names.json"
+PREFS = f"{HOME}/.config/omarchy/agent-workspaces.json"
 STATE = os.environ.get("XDG_STATE_HOME", f"{HOME}/.local/state") + "/omarchy/agent-workspaces"
 SESSIONS, NEEDS, SLUGS = (f"{STATE}/{n}.json" for n in ("sessions", "needs", "slugs"))
 GLYPHS = "◐◑◒◓✳"
@@ -182,9 +183,8 @@ EVENTS = {
     "notification":  ("notification",  (C, M)),   # Codex has no notification event
     "prompt-submit": ("prompt-submit", (C,)),     # our own short name: Claude only
     "pre-tool":      ("pre-tool",      (C,)),     # our own short name: Claude only
-    # install wires no stop hook at all — the five above are the whole set it writes.
-    # This dashed spelling is here for a stop hook someone wires by hand; the codex
-    # binary carries `stop` as well as `Stop`.
+    # Our own short names, for a line someone writes by hand; the codex binary carries
+    # `stop` as well as `Stop`. What install writes is the PascalCase set below.
     "stop":          ("stop",          (C, X, M)),
     # the shared PascalCase vocabulary
     "SessionStart":      ("session-start", (X, M, C)),
@@ -241,11 +241,22 @@ def load(path, default, strict=False):
     try:
         with open(path) as f: text = f.read()
     except OSError: return default
+    except UnicodeDecodeError:
+        # Not text at all. Same answer as unparseable: usable by nobody, overwritten by nobody.
+        if strict: raise Corrupt(path)
+        return default
     if not text.strip(): return default      # nothing written yet: not a corrupt file
-    try: return json.loads(text)
+    try: value = json.loads(text)
     except ValueError:
         if strict: raise Corrupt(path)
         return default
+    # Right syntax, wrong shape is as unusable as no syntax at all: every caller here indexes
+    # what it gets, so a list where an object belongs used to reach the caller and raise out
+    # of a hook. strict still refuses to let anyone write over it.
+    if not isinstance(value, type(default)):
+        if strict: raise Corrupt(path)
+        return default
+    return value
 
 def save(path, data, sort=True):
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -301,20 +312,23 @@ def hypr_env():
     _HYPR_ENV = env
     return env
 
+HYPR_TIMEOUT = 2   # a wedged compositor must not hold a hook open inside the agent's turn
+
 def hypr(*args):
     out = subprocess.run(["hyprctl", "-j", *args], capture_output=True, text=True,
-                         env=hypr_env()).stdout
+                         timeout=HYPR_TIMEOUT, env=hypr_env()).stdout
     return json.loads(out) if out.strip() else None
 
 def dispatch(lua):
-    subprocess.run(["hyprctl", "dispatch", lua], capture_output=True, env=hypr_env())
+    subprocess.run(["hyprctl", "dispatch", lua], capture_output=True, timeout=HYPR_TIMEOUT,
+                   env=hypr_env())
 
 def clients():
     """Hyprland's windows, or None when we could not ask at all (no hyprctl, no compositor,
     a truncated answer). Never [] for "we do not know": every "is this window still there"
     below turns on that difference, and one failed call must not retire every session."""
     try: out = hypr("clients")
-    except (OSError, ValueError): return None
+    except (OSError, ValueError, subprocess.SubprocessError): return None
     return out if isinstance(out, list) else None
 
 def cmdline(pid):
@@ -756,7 +770,10 @@ def mark_state(sid, state, at, continuing=False):
     moves the timestamp forward, at most every few seconds so the hot path still writes
     almost nothing. Without that the timestamp stayed at the moment work began, so a
     session working for longer than the hour the reaper allows was called idle while it was
-    still firing tools, and a stop that fired before the newest prompt could still land."""
+    still firing tools, and a stop that fired before the newest prompt could still land.
+
+    Returns the state it moved away from, or None when nothing moved, so the caller can tell
+    a session that has just finished from one that was idle already and said so again."""
     if not sid or not state: return
     def f(s):
         rec = s.get(sid)
@@ -765,9 +782,12 @@ def mark_state(sid, state, at, continuing=False):
         same = rec.get("state") == state
         if not same and state == "working" and (continuing or not rec.get("open")): return None
         if same and at - rec.get("state_at", 0) < HEARTBEAT: return None
+        if not same: was.append(rec.get("state"))
         rec["state"] = state; rec["state_at"] = at
         return s
+    was = []
     update(SESSIONS, f)
+    return was[0] if was else None
 
 def clear_needs(sid):
     """Drop the needs-you flags this session raised, and only those. Clearing by window
@@ -776,6 +796,186 @@ def clear_needs(sid):
     if not sid: return
     needs_write(lambda n: {k: v for k, v in n.items()
                            if not (isinstance(v, dict) and v.get("sid") == sid)})
+
+# ---------- a session finishing ----------
+# The bar dims a dot the moment a workspace stops working, which is no use when you are on
+# another workspace. So the same moment also gets a sound and a toast, the way herdr does
+# it: only when the dot actually dims, and only when the workspace is not already in front
+# of you.
+DONE_SOUND = "/usr/share/sounds/freedesktop/stereo/complete.oga"
+DONE_GLYPH = "\U000f012c"   # nf-md-check, the glyph Omarchy's own toasts take
+ABOUT_ON_TOAST = 90
+BRAILLE = "\u280b\u2819\u2839\u2838\u283c\u2834\u2826\u2827\u2807\u280f"  # the mark Codex and Muse share
+WORKING_MARKS = "\u25d0\u25d1\u25d2\u25d3" + BRAILLE   # a title starting with one keeps the dot bright
+FALSEY = ("false", "no", "off", "0", "")
+# Every one of these takes the file last and needs nothing but XDG_RUNTIME_DIR to find the
+# audio server, which hypr_env() has already recovered for a hook that was handed none.
+# First one installed wins; a machine with none plays nothing and still gets the toast.
+PLAYERS = (["pw-play", "--volume", "0.35"], ["paplay", "--volume", "22000"],
+           ["canberra-gtk-play", "-f"])
+
+def prefs(): return load(PREFS, {})
+
+def off(v):
+    """Is this switch off? The file is hand-edited JSON, so "false" in quotes is what someone
+    who meant false wrote, and a truthy string must not silently turn the switch back on."""
+    return v.strip().lower() in FALSEY if isinstance(v, str) else not v
+
+def spawn(argv):
+    """Fire and forget. A hook runs inside the agent's turn, so it must not wait on a
+    notification daemon or an audio server, and must not fail when neither is there.
+    ValueError as well as OSError: a NUL byte anywhere in the argv is not a missing program
+    but it is the same nothing-to-do, and it can arrive inside a transcript."""
+    try:
+        subprocess.Popen(argv, env=hypr_env(), stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+        return True
+    except (OSError, ValueError):
+        return False
+
+def sound_file(p):
+    """The file to play, or "" for silence. A configured path that is not a file we can hand
+    a player — gone, a directory, or a word like "--help" that a player would read as an
+    option — falls back to ours rather than reaching the command line."""
+    v = p.get("finish_sound", True)
+    if off(v): return ""
+    # Absolute as well as a file: existing does not make an argument positional, and a file
+    # called --help in whatever directory the agent happened to be in would reach the player
+    # as one. A sound you configured is a place on disk, so say where.
+    if isinstance(v, str): return v if os.path.isabs(v) and os.path.isfile(v) else DONE_SOUND
+    return DONE_SOUND
+
+def play(sound):
+    for player in PLAYERS:
+        if spawn([*player, sound]): return
+
+def one_line(text):
+    """One line of plain text for a notification. Control characters go (a NUL is not even a
+    legal argument), and so does a leading dash: omarchy-notification-send splits --flag=value
+    off its own argument, so a workspace named like an option would take over the toast."""
+    text = "".join(c if c.isprintable() else " " for c in str(text))
+    # lstrip both together: stripping the dashes first only uncovers the next word, and
+    # "- --app-name=x" is as much an option as "--app-name=x" is.
+    return " ".join(text.split()).lstrip("- ")
+
+def marked(win):
+    """Does this window's title carry one of the marks an agent spins there? If it does, the
+    title is the authority on that session — the widget reads it the same way, and it is why
+    Claude's state costs nothing to draw."""
+    t = str(win.get("title") or "")
+    return bool(t) and t[0] in GLYPHS + BRAILLE
+
+def about_line(rec, win):
+    """What it was doing, in the words the slot already shows: the opening request we kept for
+    Codex and Muse, and for Claude the title it writes for itself. Both marks are stripped —
+    Codex and Muse share one, so a session of theirs that recorded no request would otherwise
+    be announced with a spinner in front of it."""
+    about = rec.get("about") or str(win.get("title") or "").lstrip(GLYPHS + BRAILLE + " ")
+    return one_line(about)[:ABOUT_ON_TOAST]
+
+def visible_ws():
+    """Every workspace in front of you, one per monitor — not just the focused one, because a
+    workspace on your second screen has already shown you it finished. None if we could not
+    ask, which is not the same as "none of them"."""
+    try: ms = hypr("monitors")
+    except (OSError, ValueError, subprocess.SubprocessError): return None
+    if not isinstance(ms, list): return None
+    # A default only applies to a key that is absent; "activeWorkspace": null is a key that is
+    # there. Guarded the same way the client records below are, and for the same reason.
+    return {(m.get("activeWorkspace") or {}).get("id") for m in ms if isinstance(m, dict)}
+
+def announce(rec, ws, win):
+    p = prefs()
+    if not off(p.get("finish_toast", True)):
+        # The live workspace's name first: a window you moved is in a slot with its own name,
+        # and the one on the record is what the slot it left is called.
+        spawn(["omarchy-notification-send", "--app-name", "Agent Workspaces", "-g", DONE_GLYPH,
+               f"{one_line(ws_name(ws) or rec.get('name') or '') or f'Workspace {ws}'} finished",
+               about_line(rec, win)
+               or f"{str(rec.get('agent') or 'the agent').capitalize()} stopped working"])
+    sound = sound_file(p)
+    if sound: play(sound)
+
+ANNOUNCE_GAP = 3   # two sessions in one workspace finishing together dim one dot, not two
+SLOTS = 10         # the workspaces the strip draws, matching workspaceIds() in Workspaces.qml
+
+def claim_finish(sid, addrs, settled, now):
+    """Win the right to announce this dimming, in the same lock the state writes take.
+
+    Two sessions in one workspace can stop in the same breath, and after both writes have
+    landed each of them sees a quiet workspace. Only one dot dimmed, so only one of them may
+    speak: whichever takes this lock first stamps its record, and the other finds the stamp
+    against a session whose window is beside its own and holds its tongue.
+
+    It is also the last look at the records anything gets, and the only one taken after we
+    know which windows are actually in the workspace — so a session that was given something
+    to do while we were asking Hyprland is caught here, where a title that has not started
+    spinning yet would have let it through.
+
+    `addrs` is that live membership. `settled` are the windows inside it whose titles carry a
+    mark we recognise: those have already answered for themselves, the same way the widget
+    lets a title outrank a record, and a record that still says working about a window parked
+    on its idle mark is a stop hook that never arrived, not work in progress."""
+    won = []
+    def f(s):
+        rec = s.get(sid)
+        if not isinstance(rec, dict): return None
+        for o, r in s.items():
+            if o == sid or not isinstance(r, dict): continue
+            # Field types as well as record shape. Nothing but us writes this file, and we
+            # only ever write strings and numbers here, but the guard beside it would look
+            # silly stopping at the outer shape: an address that is a list is not even
+            # hashable, and a stamp that is a string cannot be compared with a time.
+            a = r.get("address")
+            if not isinstance(a, str) or a not in addrs: continue
+            if r.get("state") == "working" and a not in settled: return None
+            at = r.get("announced_at")
+            if isinstance(at, (int, float)) and at > now - ANNOUNCE_GAP: return None
+        rec["announced_at"] = now
+        won.append(True)
+        return s
+    update(SESSIONS, f)
+    return bool(won)
+
+def finished(sid):
+    """A session stopped working. Say so, unless the bar is not going to change anyway.
+
+    Every remaining question is put to Hyprland, because the widget draws from that same live
+    answer and not from what we filed at session start:
+
+      · the workspace is the one the window is on now, so a window you moved is announced
+        against the slot it is actually in, and votes in that slot rather than its old one;
+      · a window that has gone took its slot with it, which is a slot emptying, not a dimming;
+      · a workspace the strip draws no slot for — a scratchpad, anything past the tenth — has
+        no dot to dim, and a scratchpad is in front of you besides;
+      · any other title in the workspace still carrying a working mark keeps the dot bright,
+        which is both how the widget reads an agent that was open before the plugin was
+        installed and how it reads one whose stop hook never reached us.
+
+    If Hyprland cannot be asked, say nothing. Being wrong the other way is a sound fired at a
+    window you are looking at."""
+    p = prefs()
+    if off(p.get("finish_toast", True)) and not sound_file(p): return
+    rec = sessions().get(sid)
+    if not rec: return
+    cs = clients()
+    if cs is None: return
+    # owns_window, not an address match: Hyprland hands a closed window's address to the next
+    # window, and a late stop must not announce a stranger's.
+    mine = next((c for c in cs if owns_window(rec, c)), None)
+    if mine is None: return
+    ws = (mine.get("workspace") or {}).get("id")
+    if not isinstance(ws, int) or not 1 <= ws <= SLOTS: return
+    here = [c for c in cs if (c.get("workspace") or {}).get("id") == ws]
+    for c in here:
+        if c is not mine and marked(c) and str(c["title"])[0] in WORKING_MARKS: return
+    seen = visible_ws()
+    if seen is None or ws in seen: return
+    if not claim_finish(sid, {norm_addr(c.get("address")) for c in here},
+                        {norm_addr(c.get("address")) for c in here if marked(c)}, time.time()): return
+    announce(rec, ws, mine)
+
 
 def hook(event, agent=None):
     resolved = resolve_event(event)
@@ -856,7 +1056,10 @@ def hook(event, agent=None):
         # Every line names its agent on every event, so the first one fills the gap in.
         adopt(sid, agent)
         if internal == "prompt-submit": name_from_prompt(sid, row, norm)
-        mark_state(sid, STATE_OF[internal], now, canon(event) in CONTINUES)
+        was = mark_state(sid, STATE_OF[internal], now, canon(event) in CONTINUES)
+        # Only a real stop announces. The reaper also calls a stale session idle, an hour
+        # after it went quiet, which is a guess about a session nobody is waiting on.
+        if internal == "stop" and was == "working": finished(sid)
         # The session moved, so whatever it was waiting for has been answered. Only its own
         # flags go: another session in the same window may still be waiting on you.
         if sid and load(NEEDS, {}): clear_needs(sid)   # the read is the cheap exit: fires per tool
