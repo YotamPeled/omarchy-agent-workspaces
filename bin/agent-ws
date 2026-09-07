@@ -21,6 +21,7 @@ import contextlib, fcntl, glob, json, os, re, subprocess, sys, time, hashlib
 
 HOME = os.path.expanduser("~")
 CONFIG = f"{HOME}/.config/omarchy/workspace-names.json"
+PREFS = f"{HOME}/.config/omarchy/agent-workspaces.json"
 STATE = os.environ.get("XDG_STATE_HOME", f"{HOME}/.local/state") + "/omarchy/agent-workspaces"
 SESSIONS, NEEDS, SLUGS = (f"{STATE}/{n}.json" for n in ("sessions", "needs", "slugs"))
 GLYPHS = "◐◑◒◓✳"
@@ -756,7 +757,10 @@ def mark_state(sid, state, at, continuing=False):
     moves the timestamp forward, at most every few seconds so the hot path still writes
     almost nothing. Without that the timestamp stayed at the moment work began, so a
     session working for longer than the hour the reaper allows was called idle while it was
-    still firing tools, and a stop that fired before the newest prompt could still land."""
+    still firing tools, and a stop that fired before the newest prompt could still land.
+
+    Returns the state it moved away from, or None when nothing moved, so the caller can tell
+    a session that has just finished from one that was idle already and said so again."""
     if not sid or not state: return
     def f(s):
         rec = s.get(sid)
@@ -765,9 +769,12 @@ def mark_state(sid, state, at, continuing=False):
         same = rec.get("state") == state
         if not same and state == "working" and (continuing or not rec.get("open")): return None
         if same and at - rec.get("state_at", 0) < HEARTBEAT: return None
+        if not same: was.append(rec.get("state"))
         rec["state"] = state; rec["state_at"] = at
         return s
+    was = []
     update(SESSIONS, f)
+    return was[0] if was else None
 
 def clear_needs(sid):
     """Drop the needs-you flags this session raised, and only those. Clearing by window
@@ -776,6 +783,82 @@ def clear_needs(sid):
     if not sid: return
     needs_write(lambda n: {k: v for k, v in n.items()
                            if not (isinstance(v, dict) and v.get("sid") == sid)})
+
+# ---------- a session finishing ----------
+# The bar dims a dot the moment a workspace stops working, which is no use when you are on
+# another workspace. So the same moment also gets a sound and a toast, the way herdr does
+# it: only when the dot actually dims, and only when you are not already looking at it.
+DONE_SOUND = "/usr/share/sounds/freedesktop/stereo/complete.oga"
+DONE_GLYPH = "\U000f012c"   # nf-md-check, the glyph Omarchy's own toasts take
+ABOUT_ON_TOAST = 90
+# Every one of these takes the file last and needs nothing but XDG_RUNTIME_DIR to find the
+# audio server, which hypr_env() has already recovered for a hook that was handed none.
+# First one installed wins; a machine with none plays nothing and still gets the toast.
+PLAYERS = (["pw-play", "--volume", "0.35"], ["paplay", "--volume", "22000"],
+           ["canberra-gtk-play", "-f"])
+
+def prefs(): return load(PREFS, {})
+
+def spawn(argv):
+    """Fire and forget. A hook runs inside the agent's turn, so it must not wait on a
+    notification daemon or an audio server, and must not fail when neither is there."""
+    try:
+        subprocess.Popen(argv, env=hypr_env(), stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+        return True
+    except OSError:
+        return False
+
+def play(sound):
+    for player in PLAYERS:
+        if spawn([*player, sound]): return
+
+def about_line(rec):
+    """What the session is doing, in the words the slot already uses: the opening request we
+    kept for Codex and Muse, and for Claude the window title it writes for itself, less the
+    spinner it parks on."""
+    about = rec.get("about") or ""
+    if not about and rec.get("address"):
+        for c in clients() or []:
+            if norm_addr(c.get("address")) == rec["address"]:
+                about = str(c.get("title") or "").lstrip(GLYPHS + " ")
+                break
+    return " ".join(str(about).split())[:ABOUT_ON_TOAST]
+
+def announce(rec, ws):
+    p = prefs()
+    label = rec.get("name") or ws_name(ws) or f"Workspace {ws}"
+    if p.get("finish_toast", True):
+        # The headline always carries the name inside a longer sentence, so a workspace named
+        # after something that looks like an option is still one word of text, never a flag.
+        spawn(["omarchy-notification-send", "--app-name", "Agent Workspaces",
+               "-g", DONE_GLYPH, f"{label} finished",
+               about_line(rec) or f"{(rec.get('agent') or 'the agent').capitalize()} stopped working"])
+    sound = p.get("finish_sound", True)
+    if sound: play(sound if isinstance(sound, str) else DONE_SOUND)
+
+def finished(sid):
+    """A session stopped working. Announce it only when the slot on the bar actually changes:
+    another session still working in that workspace leaves the dot bright, and a workspace
+    already on screen has just told you itself.
+
+    If Hyprland cannot be asked which workspace you are on, say nothing. Being wrong the
+    other way is a sound fired at a window you are looking at."""
+    p = prefs()
+    if not (p.get("finish_toast", True) or p.get("finish_sound", True)): return
+    all_ = sessions()
+    rec = all_.get(sid)
+    if not rec: return
+    ws = rec.get("workspace")
+    for other, r in all_.items():
+        if other != sid and r.get("workspace") == ws and r.get("open") \
+           and r.get("state") == "working": return
+    try:
+        if focused_ws() == ws: return
+    except (OSError, ValueError, TypeError, KeyError): return
+    announce(rec, ws)
+
 
 def hook(event, agent=None):
     resolved = resolve_event(event)
@@ -856,7 +939,10 @@ def hook(event, agent=None):
         # Every line names its agent on every event, so the first one fills the gap in.
         adopt(sid, agent)
         if internal == "prompt-submit": name_from_prompt(sid, row, norm)
-        mark_state(sid, STATE_OF[internal], now, canon(event) in CONTINUES)
+        was = mark_state(sid, STATE_OF[internal], now, canon(event) in CONTINUES)
+        # Only a real stop announces. The reaper also calls a stale session idle, an hour
+        # after it went quiet, which is a guess about a session nobody is waiting on.
+        if internal == "stop" and was == "working": finished(sid)
         # The session moved, so whatever it was waiting for has been answered. Only its own
         # flags go: another session in the same window may still be waiting on you.
         if sid and load(NEEDS, {}): clear_needs(sid)   # the read is the cheap exit: fires per tool

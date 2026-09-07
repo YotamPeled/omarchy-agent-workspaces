@@ -28,6 +28,23 @@ to see them all.
 Every mark takes its colour from your active Omarchy theme. Change the theme and the strip
 changes with it.
 
+## When something finishes
+
+A dot dimming is no use on a workspace you are not looking at, so the same moment also plays
+a short sound and raises an Omarchy notification saying which workspace finished and what it
+was doing. It fires only when the slot actually changes — another session still working in
+that workspace leaves the dot bright — and never for a workspace already on your screen.
+
+Both parts are on by default and are turned off, or pointed at a sound of your own, in
+`~/.config/omarchy/agent-workspaces.json`:
+
+```json
+{ "finish_sound": "/usr/share/sounds/freedesktop/stereo/complete.oga", "finish_toast": true }
+```
+
+`false` for either switches it off. The sound is played by whichever of `pw-play`, `paplay` or
+`canberra-gtk-play` is installed; a machine with none of them still gets the notification.
+
 ## Three agents
 
 Claude Code, Codex and Muse Code all show up the same way. Install wires whichever of them is
@@ -170,7 +187,9 @@ loaded after the packaged defaults, so an `omarchy update` cannot break it.
 
 Install does edit files you own — `~/.claude/settings.json`, `~/.codex/hooks.json`,
 `~/.config/hypr/bindings.lua` and `~/.config/hypr/autostart.lua`, plus your `shell.json` — and
-installs one Muse plugin. Everything it adds is marked, and uninstall takes back exactly what
+installs one Muse plugin. It reads one file it never writes,
+`~/.config/omarchy/agent-workspaces.json`, for the finish sound and notification. Everything
+it adds is marked, and uninstall takes back exactly what
 it added and nothing else, including a hook of your own that happens to be written the same
 way ours is.
 
@@ -193,7 +212,8 @@ letter in the slot comes from the record its hooks wrote, or is left off.
 Omarchy with the Quickshell bar, Hyprland, Python 3, and at least one of Claude Code, Codex
 and Muse Code. `~/.local/bin` on your
 PATH. `omarchy-launch-tui` and `omarchy menu` come with Omarchy and are used for opening
-sessions and for the reset confirmation.
+sessions and for the reset confirmation. The finish sound wants one of `pw-play`, `paplay`
+or `canberra-gtk-play`, and is skipped if none is installed.
 
 ## Licence
 
