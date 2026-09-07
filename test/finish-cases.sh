@@ -308,6 +308,36 @@ cfg '{"finish_sound": "--help"}'; seed "$W"; ( cd "$S" && fire Stop codex '{"ses
 check "is refused for not saying where it is" "$(n "pw-play|--volume|0.35|--help")" "0"
 rm -f "$S/.config/omarchy/agent-workspaces.json"
 
+echo "a session finishing a moment after one beside it already spoke"
+mkdir -p "$S/state"; : > "$S/fired.txt"
+python3 -c "
+import json, time
+json.dump({'a': {'agent': 'codex', 'open': True, 'workspace': 5, 'address': 'aa',
+                 'state': 'working', 'state_at': 1, 'about': 'boxes'},
+           'b': {'agent': 'claude', 'open': True, 'workspace': 5, 'address': 'bb',
+                 'state': 'idle', 'state_at': 1, 'announced_at': time.time()}},
+          open('$S/state/sessions.json', 'w'))"
+CLIENTS='[{"address":"0xaa","title":"","workspace":{"id":5}},{"address":"0xbb","title":"","workspace":{"id":5}}]' \
+  fire Stop codex '{"session_id":"a"}'
+check "says nothing: one dot dimmed and it has been said" "$(quiet)" "0"
+
+echo "the session that does speak"
+seed "$W"; fire Stop codex '{"session_id":"a"}'
+check "leaves the mark that says so" \
+  "$(python3 -c "import json;print('announced_at' in json.load(open('$S/state/sessions.json'))['a'])")" "True"
+
+echo "a record whose fields are the wrong types entirely"
+mkdir -p "$S/state"; : > "$S/fired.txt"
+python3 -c "
+import json
+json.dump({'a': {'agent': 'codex', 'open': True, 'workspace': 5, 'address': 'aa',
+                 'state': 'working', 'state_at': 1, 'about': 'boxes'},
+           'b': {'address': ['not', 'a', 'string'], 'announced_at': 'soon', 'state': 'working'}},
+          open('$S/state/sessions.json', 'w'))"
+fire Stop codex '{"session_id":"a"}'
+check "does not take the hook down" "$rc" "0"
+check "and the state write still landed" "$(state a)" "idle"
+
 echo "a stop from a session nobody has a record of"
 seed '{}'; fire Stop codex '{"session_id":"ghost"}'
 check "announces nothing" "$(cat "$S/fired.txt")" ""

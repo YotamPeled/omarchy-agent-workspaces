@@ -893,7 +893,7 @@ def announce(rec, ws, win):
         spawn(["omarchy-notification-send", "--app-name", "Agent Workspaces", "-g", DONE_GLYPH,
                f"{one_line(ws_name(ws) or rec.get('name') or '') or f'Workspace {ws}'} finished",
                about_line(rec, win)
-               or f"{(rec.get('agent') or 'the agent').capitalize()} stopped working"])
+               or f"{str(rec.get('agent') or 'the agent').capitalize()} stopped working"])
     sound = sound_file(p)
     if sound: play(sound)
 
@@ -922,9 +922,16 @@ def claim_finish(sid, addrs, settled, now):
         rec = s.get(sid)
         if not isinstance(rec, dict): return None
         for o, r in s.items():
-            if o == sid or not isinstance(r, dict) or r.get("address") not in addrs: continue
-            if r.get("state") == "working" and r["address"] not in settled: return None
-            if r.get("announced_at", 0) > now - ANNOUNCE_GAP: return None
+            if o == sid or not isinstance(r, dict): continue
+            # Field types as well as record shape. Nothing but us writes this file, and we
+            # only ever write strings and numbers here, but the guard beside it would look
+            # silly stopping at the outer shape: an address that is a list is not even
+            # hashable, and a stamp that is a string cannot be compared with a time.
+            a = r.get("address")
+            if not isinstance(a, str) or a not in addrs: continue
+            if r.get("state") == "working" and a not in settled: return None
+            at = r.get("announced_at")
+            if isinstance(at, (int, float)) and at > now - ANNOUNCE_GAP: return None
         rec["announced_at"] = now
         won.append(True)
         return s
