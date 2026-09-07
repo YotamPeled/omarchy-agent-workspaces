@@ -47,8 +47,8 @@ Both parts are on by default and are turned off, or pointed at a sound of your o
 { "finish_sound": "/usr/share/sounds/freedesktop/stereo/complete.oga", "finish_toast": true }
 ```
 
-`false` for either switches it off, quoted or not. A `finish_sound` that is not a file we can
-play falls back to the default rather than reaching a player. The sound goes to whichever of
+`false` for either switches it off, quoted or not. A `finish_sound` that is not an absolute
+path to a file falls back to the default rather than reaching a player. The sound goes to whichever of
 `pw-play`, `paplay` or `canberra-gtk-play` is installed; a machine with none of them still gets
 the notification.
 
