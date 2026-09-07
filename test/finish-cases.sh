@@ -115,6 +115,12 @@ CLIENTS='[{"address":"0xaa","title":"","workspace":{"id":5}},{"address":"0xcc","
   fire Stop codex '{"session_id":"a"}'
 check "keeps the dot bright, so nothing is announced" "$(quiet)" "0"
 
+echo "the mark Codex and Muse share, on a window with no record either"
+seed "$W"
+CLIENTS='[{"address":"0xaa","title":"","workspace":{"id":5}},{"address":"0xcc","title":"⠹ something","workspace":{"id":5}}]' \
+  fire Stop codex '{"session_id":"a"}'
+check "keeps the dot bright just the same" "$(quiet)" "0"
+
 echo "an untitled window sharing the workspace"
 seed "$W"
 CLIENTS='[{"address":"0xaa","title":"","workspace":{"id":5}},{"address":"0xcc","title":"","workspace":{"id":5}}]' \
@@ -297,7 +303,7 @@ check "and falls back to the defaults" "$(n omarchy-notification-send)" "1"
 rm -f "$S/.config/omarchy/agent-workspaces.json"
 
 echo "a sound named like an option that really is a file, in whatever directory we were run from"
-( cd "$S" && : > -- "--help" ) 2>/dev/null || : > "$S/--help"
+: > "$S/--help"    # a real file, named like an option, in the directory we will run from
 cfg '{"finish_sound": "--help"}'; seed "$W"; ( cd "$S" && fire Stop codex '{"session_id":"a"}' )
 check "is refused for not saying where it is" "$(n "pw-play|--volume|0.35|--help")" "0"
 rm -f "$S/.config/omarchy/agent-workspaces.json"
